@@ -46,11 +46,16 @@ results/*.csv
 Thumbs.db
 
 # ───────────────────────────────────────────────────────────────
+# Internal working docs (PRD / plan / agent state) — not part of the deliverable
+# ───────────────────────────────────────────────────────────────
+.claude/
+
+# ───────────────────────────────────────────────────────────────
 # Misc
 # ───────────────────────────────────────────────────────────────
 *.log
 *.tmp
 *.bak
 
-# NOTE: do NOT ignore Makefile, hostfile, scripts/, src/, *.md, or .claude/ —
+# NOTE: do NOT ignore Makefile, hostfile, scripts/, src/, or *.md —
 # those are all part of the project and must be committed.
