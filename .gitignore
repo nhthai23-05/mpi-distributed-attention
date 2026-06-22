@@ -1,69 +1,56 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+# ───────────────────────────────────────────────────────────────
+# Build artifacts
+# ───────────────────────────────────────────────────────────────
+# Object files
 *.o
 *.obj
+src/*.o
 
-# Precompiled Headers
+# Compiled binaries (no extension — must be named explicitly)
+hybrid_attention
+mpi-prime
+
+# Other compiled outputs
+*.out
+*.exe
+*.so
+*.a
+*.dwo
 *.gch
 *.pch
 
-# Linker files
-*.ilk
+# ───────────────────────────────────────────────────────────────
+# Benchmark output
+# ───────────────────────────────────────────────────────────────
+# Scratch / temp files written by the bench scripts (always throwaway)
+results/.speedup_tmp.csv
+results/*_tmp.csv
+results/.*tmp*
 
-# Debugger Files
-*.pdb
+# Auto-generated result CSVs (regenerable; commit the FINAL ones you want
+# for the report with:  git add -f results/<file>.csv)
+results/*.csv
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
+# Keep the results/ directory itself in the repo
+!results/.gitkeep
 
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
+# ───────────────────────────────────────────────────────────────
+# Editor / OS noise
+# ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
 *.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# vcpkg
-vcpkg_installed/
+# ───────────────────────────────────────────────────────────────
+# Misc
+# ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
 
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+# NOTE: do NOT ignore Makefile, hostfile, scripts/, src/, *.md, or .claude/ —
+# those are all part of the project and must be committed.
