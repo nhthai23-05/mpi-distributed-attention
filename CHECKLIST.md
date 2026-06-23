@@ -141,9 +141,10 @@ Legend:  👤 = only you can do it (needs the physical machines / your password)
   ```bash
   TOTAL_PROCS=<cores> N=<chosen_N> MODE=hybrid bash scripts/bench_granularity.sh
   ```
-- [ ] **Chart D (speedup, 1→2X processes):**
+- [ ] **Chart D (speedup, 1→2X processes):** uses `tensor` mode so the same
+      kernel runs at every P (hybrid can't run at P=1, so it can't anchor the chart).
   ```bash
-  TOTAL_PROCS=<2x cores> N=<chosen_N> MODE=hybrid bash scripts/bench_speedup.sh
+  TOTAL_PROCS=<2x cores> N=<chosen_N> MODE=tensor bash scripts/bench_speedup.sh
   ```
 - [ ] Results land in `results/*.csv`. Hand these to Claude to make the charts.
 

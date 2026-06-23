@@ -11,6 +11,7 @@
 #include "head_parallel.h"
 #include "tensor_parallel.h"
 #include "hybrid.h"
+#include "progress.h"
 
 /* ------------------------------------------------------------------ */
 /* Configuration defaults                                               */
@@ -48,7 +49,8 @@ static void usage(const char *prog) {
         "  --cannon                            tensor mode: use Cannon's algorithm\n"
         "                                      (needs perfect-square procs)\n"
         "  --csv                               output CSV timing line per rank\n"
-        "  --no-check                          skip correctness check\n",
+        "  --no-check                          skip correctness check\n"
+        "  --progress                          print rank-0 progress + ETA to stderr\n",
         prog, DEFAULT_SEQ_LEN, DEFAULT_NUM_HEADS, DEFAULT_D_MODEL);
 }
 
@@ -68,6 +70,7 @@ int main(int argc, char **argv) {
     int  use_cannon = 0;
     int  csv_output = 0;
     int  do_check   = 1;
+    int  show_progress = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
@@ -91,9 +94,35 @@ int main(int argc, char **argv) {
             csv_output = 1;
         } else if (strcmp(argv[i], "--no-check") == 0) {
             do_check = 0;
+        } else if (strcmp(argv[i], "--progress") == 0) {
+            show_progress = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             if (rank == 0) usage(argv[0]);
             MPI_Finalize(); return 0;
+        }
+    }
+
+    /* Validate configuration up front. Every rank parsed the same args, so all
+     * reach the same verdict and exit collectively — no silent wrong results
+     * or div-by-zero deep inside the parallel modes. */
+    {
+        const char *why = NULL;
+        if      (seq_len   <= 0)                why = "--seq-len must be > 0";
+        else if (num_heads <= 0)                why = "--heads must be > 0";
+        else if (d_model   <= 0)                why = "--d-model must be > 0";
+        else if (d_model % num_heads != 0)      why = "--d-model must be divisible by --heads";
+        else if (mode == MODE_HYBRID) {
+            if      (num_groups <= 0)             why = "--groups must be > 0";
+            else if (size % num_groups != 0)     why = "process count must be divisible by --groups";
+            else if (num_heads % num_groups != 0) why = "--heads must be divisible by --groups";
+        }
+        if (why) {
+            if (rank == 0)
+                fprintf(stderr,
+                    "config error: %s (seq_len=%d heads=%d d_model=%d groups=%d procs=%d)\n",
+                    why, seq_len, num_heads, d_model, num_groups, size);
+            MPI_Finalize();
+            return 1;
         }
     }
 
@@ -102,6 +131,7 @@ int main(int argc, char **argv) {
         printf("rank,seq_len,t_io,t_compute,t_comm\n");
 
     profiler_init();
+    progress_enable(show_progress);
 
     /* Allocate Q, K, V on all ranks (data_gen makes them identical everywhere) */
     Tensor Q = tensor_alloc(seq_len, d_model);
@@ -188,6 +218,7 @@ int main(int argc, char **argv) {
         printf("[%s] wall=%.4fs  seq_len=%d  d_model=%d  heads=%d  procs=%d\n",
                mode == MODE_HEAD ? "HEAD" : mode == MODE_TENSOR ? "TENSOR" : "HYBRID",
                wall_end - wall_start, seq_len, d_model, num_heads, size);
+        profiler_print_summary(rank);   /* IO / compute / comm split for rank 0 */
     }
 
     /* --- Correctness check --- */

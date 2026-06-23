@@ -8,8 +8,11 @@ Tensor tensor_alloc(int rows, int cols) {
     Tensor t;
     t.rows = rows;
     t.cols = cols;
-    t.data = (float *)malloc((size_t)rows * cols * sizeof(float));
-    if (!t.data) {
+    size_t n = (size_t)rows * cols;
+    /* A zero-size tensor is legal (e.g. a rank that owns no head columns).
+     * malloc(0) may return NULL, which is not an error here. */
+    t.data = n ? (float *)malloc(n * sizeof(float)) : NULL;
+    if (n && !t.data) {
         fprintf(stderr, "tensor_alloc: out of memory (%d x %d)\n", rows, cols);
         exit(1);
     }

@@ -7,6 +7,7 @@ SRCS = src/main.c \
        src/tensor.c \
        src/data_gen.c \
        src/profiler.c \
+       src/progress.c \
        src/attention.c \
        src/head_parallel.c \
        src/tensor_parallel.c \

@@ -1,6 +1,7 @@
 #include "tensor_parallel.h"
 #include "tensor.h"
 #include "profiler.h"
+#include "progress.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -67,6 +68,7 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
     float scale = 1.0f / sqrtf((float)d_k);
     float *srow = malloc((size_t)seq_len * sizeof(float));
 
+    progress_begin("tensor-attn rows", my_rows);
     for (int i = 0; i < my_rows; i++) {
         /* scores = Q_i . K_j^T * scale, track row max for stability */
         float mx = -INFINITY;
@@ -85,14 +87,21 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
         }
         for (int j = 0; j < seq_len; j++) srow[j] /= sum;
 
-        /* O_i = softmax_row . V */
-        for (int k = 0; k < d_k; k++) {
-            float acc = 0.0f;
-            for (int j = 0; j < seq_len; j++)
-                acc += srow[j] * Vf[j * d_k + k];
-            Ob[i * d_k + k] = acc;
+        /* O_i = softmax_row . V
+         * Accumulate row-by-row over j so V is read sequentially (row-major)
+         * instead of strided down a column. Each Ob[i][k] still sums j in the
+         * same 0..seq_len-1 order, so the result is bitwise identical. */
+        float *orow = &Ob[i * d_k];
+        for (int k = 0; k < d_k; k++) orow[k] = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            float w = srow[j];
+            const float *vrow = &Vf[j * d_k];
+            for (int k = 0; k < d_k; k++)
+                orow[k] += w * vrow[k];
         }
+        progress_update(i + 1);
     }
+    progress_end();
     free(srow);
     profiler_stop(TIMER_COMPUTE);
 

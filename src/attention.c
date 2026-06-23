@@ -1,4 +1,5 @@
 #include "attention.h"
+#include "progress.h"
 #include <math.h>
 #include <string.h>
 
@@ -34,6 +35,7 @@ void mha_seq(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,
 
     tensor_zero(out_full);
 
+    progress_begin("seq baseline heads", num_heads);
     for (int h = 0; h < num_heads; h++) {
         /* extract head slice: columns [h*d_k, (h+1)*d_k) */
         Tensor Qh = tensor_alloc(seq_len, d_k);
@@ -55,5 +57,7 @@ void mha_seq(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,
 
         tensor_free(&Qh); tensor_free(&Kh);
         tensor_free(&Vh); tensor_free(&Oh);
+        progress_update(h + 1);
     }
+    progress_end();
 }

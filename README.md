@@ -147,7 +147,8 @@ TOTAL_PROCS=<cores> MODE=hybrid bash scripts/bench_n_sizing.sh
 TOTAL_PROCS=<cores> N=<chosen_N> MODE=hybrid bash scripts/bench_granularity.sh
 
 # Chart D — speedup as processes scale 1 → 2×cores
-TOTAL_PROCS=<2×cores> N=<chosen_N> MODE=hybrid bash scripts/bench_speedup.sh
+# (tensor mode: same kernel at every P, including the P=1 anchor — hybrid can't run at P=1)
+TOTAL_PROCS=<2×cores> N=<chosen_N> MODE=tensor bash scripts/bench_speedup.sh
 ```
 
 Each run separates **computation time** from **communication time** via

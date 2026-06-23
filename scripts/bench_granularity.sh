@@ -7,6 +7,10 @@
 # Output: results/granularity.csv
 #   rank,seq_len,t_io,t_compute,t_comm
 
+# Force C locale so awk/printf use '.' decimals — a ',' decimal (some locales)
+# would corrupt the comma-separated CSV and break the imbalance arithmetic.
+export LC_ALL=C
+
 BINARY="./hybrid_attention"
 MODE="${MODE:-hybrid}"
 TOTAL_PROCS="${TOTAL_PROCS:-4}"
@@ -20,13 +24,17 @@ OUT="$RESULTS_DIR/granularity.csv"
 echo "rank,seq_len,t_io,t_compute,t_comm" > "$OUT"
 
 echo "Running granularity benchmark: N=$N, procs=$TOTAL_PROCS, mode=$MODE"
+step_start=$SECONDS
+# --progress prints rank-0 % + ETA to stderr (passed through to the terminal);
+# CSV stays clean on stdout.
 mpirun --oversubscribe --prefix /usr \
        --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
        --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
        -np "$TOTAL_PROCS" --hostfile "$HOSTFILE" \
-       "$BINARY" --mode "$MODE" --seq-len "$N" --csv --no-check 2>/dev/null \
+       "$BINARY" --mode "$MODE" --seq-len "$N" --csv --no-check --progress \
     | grep -v "^rank" >> "$OUT"
 
+echo "  (wall $(( SECONDS - step_start ))s)"
 echo ""
 echo "Results written to $OUT"
 echo ""
