@@ -71,11 +71,11 @@ void softmax_rows(Tensor *t) {
 }
 
 void tensor_scale(Tensor *t, float s) {
-    int n = t->rows * t->cols;
-    for (int i = 0; i < n; i++) t->data[i] *= s;
+    size_t n = (size_t)t->rows * t->cols;
+    for (size_t i = 0; i < n; i++) t->data[i] *= s;
 }
 
 void tensor_add_inplace(Tensor *dst, const Tensor *src) {
-    int n = dst->rows * dst->cols;
-    for (int i = 0; i < n; i++) dst->data[i] += src->data[i];
+    size_t n = (size_t)dst->rows * dst->cols;
+    for (size_t i = 0; i < n; i++) dst->data[i] += src->data[i];
 }

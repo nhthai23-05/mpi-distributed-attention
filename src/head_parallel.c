@@ -5,6 +5,33 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/*
+ * Pack rank r's head columns from src [seq_len x d_model] into dst at byte
+ * offset buf_off.  Columns [col_off, col_off+rc) for every row are copied
+ * contiguously, producing a [seq_len x rc] row-major block ready for scatter.
+ */
+static void pack_columns(float *dst, int buf_off,
+                         const Tensor *src, int col_off, int rc) {
+    int seq_len = src->rows;
+    for (int i = 0; i < seq_len; i++)
+        memcpy(dst + buf_off + i * rc,
+               &AT(*src, i, col_off),
+               rc * sizeof(float));
+}
+
+/*
+ * Inverse: unpack a [seq_len x rc] block from src at buf_off back into
+ * columns [col_off, col_off+rc) of dst [seq_len x d_model].
+ */
+static void unpack_columns(Tensor *dst, int col_off,
+                           const float *src, int buf_off, int rc) {
+    int seq_len = dst->rows;
+    for (int i = 0; i < seq_len; i++)
+        memcpy(&AT(*dst, i, col_off),
+               src + buf_off + i * rc,
+               rc * sizeof(float));
+}
+
 void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,
                        Tensor *out_full, int num_heads, MPI_Comm comm) {
     int rank, size;
@@ -14,61 +41,79 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
     int seq_len = (rank == 0) ? Q_full->rows : 0;
     int d_model = (rank == 0) ? Q_full->cols : 0;
 
-    /* Broadcast dimensions */
     MPI_Bcast(&seq_len, 1, MPI_INT, 0, comm);
     MPI_Bcast(&d_model, 1, MPI_INT, 0, comm);
 
     int d_k = d_model / num_heads;
-
-    /* Each rank owns heads_per_rank consecutive heads */
     int heads_per_rank = num_heads / size;
-    int my_heads       = heads_per_rank;
-    /* last rank takes the remainder */
-    if (rank == size - 1) my_heads += num_heads % size;
 
-    int my_slice_cols = my_heads * d_k;  /* columns this rank owns */
+    /* Last rank absorbs the remainder heads (if num_heads % size != 0). */
+    int my_heads = heads_per_rank + (rank == size - 1 ? num_heads % size : 0);
+    int my_cols  = my_heads * d_k;
 
-    /* Scatter: root sends each rank its head columns for Q, K, V */
-    profiler_start(TIMER_COMM);
-
-    /* Build scatter counts/displacements (rows * cols_per_rank) */
+    /*
+     * Build per-rank sendcounts and displacements for the FULL slice
+     * (seq_len rows × rh*d_k cols).  Only root fills these; other ranks
+     * pass NULL to MPI_Scatterv/Gatherv where the spec says the args are
+     * insignificant.
+     */
     int *sendcounts = NULL, *displs = NULL;
     if (rank == 0) {
         sendcounts = malloc(size * sizeof(int));
         displs     = malloc(size * sizeof(int));
-        int offset = 0;
+        int off = 0;
         for (int r = 0; r < size; r++) {
-            int rh = (r == size - 1) ? heads_per_rank + num_heads % size : heads_per_rank;
-            /* We scatter one row at a time via MPI_Scatterv in a loop */
-            sendcounts[r] = rh * d_k;
-            displs[r]     = offset;
-            offset       += rh * d_k;
+            int rh = heads_per_rank + (r == size - 1 ? num_heads % size : 0);
+            sendcounts[r] = seq_len * rh * d_k;
+            displs[r]     = off;
+            off          += sendcounts[r];
         }
     }
 
-    /* Allocate local head slices */
-    Tensor Ql = tensor_alloc(seq_len, my_slice_cols);
-    Tensor Kl = tensor_alloc(seq_len, my_slice_cols);
-    Tensor Vl = tensor_alloc(seq_len, my_slice_cols);
+    /* Allocate local head slices. */
+    Tensor Ql = tensor_alloc(seq_len, my_cols);
+    Tensor Kl = tensor_alloc(seq_len, my_cols);
+    Tensor Vl = tensor_alloc(seq_len, my_cols);
 
-    /* Scatter row by row for Q, K, V */
-    for (int i = 0; i < seq_len; i++) {
-        float *qrow = (rank == 0) ? &AT(*Q_full, i, 0) : NULL;
-        float *krow = (rank == 0) ? &AT(*K_full, i, 0) : NULL;
-        float *vrow = (rank == 0) ? &AT(*V_full, i, 0) : NULL;
+    /*
+     * SCATTER: pack Q/K/V column blocks for each rank into a contiguous
+     * buffer on root (single MPI_Scatterv per matrix instead of seq_len calls).
+     */
+    profiler_start(TIMER_COMM);
+    {
+        float *Q_packed = NULL, *K_packed = NULL, *V_packed = NULL;
+        if (rank == 0) {
+            int total = displs[size - 1] + sendcounts[size - 1];
+            Q_packed = malloc((size_t)total * sizeof(float));
+            K_packed = malloc((size_t)total * sizeof(float));
+            V_packed = malloc((size_t)total * sizeof(float));
 
-        MPI_Scatterv(qrow, sendcounts, displs, MPI_FLOAT,
-                     &AT(Ql, i, 0), my_slice_cols, MPI_FLOAT, 0, comm);
-        MPI_Scatterv(krow, sendcounts, displs, MPI_FLOAT,
-                     &AT(Kl, i, 0), my_slice_cols, MPI_FLOAT, 0, comm);
-        MPI_Scatterv(vrow, sendcounts, displs, MPI_FLOAT,
-                     &AT(Vl, i, 0), my_slice_cols, MPI_FLOAT, 0, comm);
+            int col_off = 0, buf_off = 0;
+            for (int r = 0; r < size; r++) {
+                int rh = heads_per_rank + (r == size - 1 ? num_heads % size : 0);
+                int rc = rh * d_k;
+                pack_columns(Q_packed, buf_off, Q_full, col_off, rc);
+                pack_columns(K_packed, buf_off, K_full, col_off, rc);
+                pack_columns(V_packed, buf_off, V_full, col_off, rc);
+                col_off += rc;
+                buf_off += seq_len * rc;
+            }
+        }
+
+        MPI_Scatterv(Q_packed, sendcounts, displs, MPI_FLOAT,
+                     Ql.data, seq_len * my_cols, MPI_FLOAT, 0, comm);
+        MPI_Scatterv(K_packed, sendcounts, displs, MPI_FLOAT,
+                     Kl.data, seq_len * my_cols, MPI_FLOAT, 0, comm);
+        MPI_Scatterv(V_packed, sendcounts, displs, MPI_FLOAT,
+                     Vl.data, seq_len * my_cols, MPI_FLOAT, 0, comm);
+
+        if (rank == 0) { free(Q_packed); free(K_packed); free(V_packed); }
     }
     profiler_stop(TIMER_COMM);
 
-    /* Each rank computes attention on each of its heads */
+    /* Each rank computes attention on each of its heads. */
     profiler_start(TIMER_COMPUTE);
-    Tensor out_local = tensor_alloc(seq_len, my_slice_cols);
+    Tensor out_local = tensor_alloc(seq_len, my_cols);
 
     for (int h = 0; h < my_heads; h++) {
         Tensor Qh = tensor_alloc(seq_len, d_k);
@@ -92,12 +137,30 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
     }
     profiler_stop(TIMER_COMPUTE);
 
-    /* Gather results back to rank 0 */
+    /*
+     * GATHER: collect out_local from every rank into a packed buffer on root,
+     * then unpack each rank's block back into the right columns of out_full.
+     */
     profiler_start(TIMER_COMM);
-    for (int i = 0; i < seq_len; i++) {
-        float *orow = (rank == 0) ? &AT(*out_full, i, 0) : NULL;
-        MPI_Gatherv(&AT(out_local, i, 0), my_slice_cols, MPI_FLOAT,
-                    orow, sendcounts, displs, MPI_FLOAT, 0, comm);
+    {
+        float *out_packed = (rank == 0)
+            ? malloc((size_t)seq_len * d_model * sizeof(float))
+            : NULL;
+
+        MPI_Gatherv(out_local.data, seq_len * my_cols, MPI_FLOAT,
+                    out_packed, sendcounts, displs, MPI_FLOAT, 0, comm);
+
+        if (rank == 0) {
+            int col_off = 0, buf_off = 0;
+            for (int r = 0; r < size; r++) {
+                int rh = heads_per_rank + (r == size - 1 ? num_heads % size : 0);
+                int rc = rh * d_k;
+                unpack_columns(out_full, col_off, out_packed, buf_off, rc);
+                col_off += rc;
+                buf_off += seq_len * rc;
+            }
+            free(out_packed);
+        }
     }
     profiler_stop(TIMER_COMM);
 
