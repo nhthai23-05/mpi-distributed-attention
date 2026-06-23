@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""bench_scaling.py — sweep N and compare sequential vs head-parallel performance.
+"""bench_scaling.py — sweep N and compare sequential vs parallel performance.
 
 Demonstrates that communication overhead is amortised as N grows: for small N
 the parallel speedup is low (MPI overhead dominates), but it rises toward the
 ideal P× speedup as the O(N²) compute work dominates.
+
+Mode selection per process count P:
+  P == 1            → sequential (--mode seq)
+  1 < P <= heads    → head-parallel (--mode head)
+  P > heads         → hybrid (--mode hybrid, needs --groups)
 
 Usage
 -----
@@ -12,6 +17,8 @@ Usage
   --binary PATH    path to the hybrid_attention binary  (default: ./hybrid_attention)
   --procs LIST     comma-separated process counts       (default: 1,2,4)
   --heads N        number of attention heads            (default: 4)
+  --groups N       head groups for hybrid mode          (default: same as --heads)
+                   P must be divisible by groups; heads must be divisible by groups
   --d-model N      model dimension                      (default: 512)
   --sizes LIST     comma-separated N (seq_len) values   (default: 64,128,256,512,1024,2048,4096)
   --repeats N      repetitions per (N, procs) pair      (default: 3; best-of is used)
@@ -19,6 +26,12 @@ Usage
   --no-plot        skip matplotlib chart generation
   --hostfile PATH  MPI hostfile (default: none; omit for local single-machine runs)
   --oversubscribe  pass --oversubscribe to mpirun (needed on single machines)
+
+Cluster example (60 procs, 4 heads, 4 groups → 15 procs per head via tensor-par):
+  python3 scripts/bench_scaling.py \\
+    --procs 1,4,8,16,32,60 --heads 4 --groups 4 --d-model 512 \\
+    --sizes 256,512,1024,2048,4096,8192 \\
+    --hostfile hostfile --no-oversubscribe
 
 Output
 ------
@@ -44,6 +57,8 @@ def parse_args():
     ap.add_argument("--procs",       default="1,2,4",
                     help="comma-separated list of MPI process counts")
     ap.add_argument("--heads",       type=int, default=4)
+    ap.add_argument("--groups",      type=int, default=None,
+                    help="groups for hybrid mode (default: same as --heads)")
     ap.add_argument("--d-model",     type=int, default=512, dest="d_model")
     ap.add_argument("--sizes",       default="64,128,256,512,1024,2048,4096",
                     help="comma-separated seq_len values to sweep")
@@ -93,28 +108,42 @@ def run_seq(args, N):
 
 
 def run_parallel(args, N, np):
-    """Return best head-parallel wall time over `repeats` runs (seconds)."""
+    """Return best head-parallel wall time over `repeats` runs (seconds).
+    Returns (time, mode_label) or (None, None) if not applicable."""
     best = float("inf")
-    # Clamp procs to num_heads: head mode assigns at least 1 head per rank
-    if np > args.heads:
-        return None
+
+    # Choose mode: head when P fits within num_heads, hybrid for larger P
+    if np <= args.heads:
+        mode = "head"
+        extra = []
+        pattern = r"\[HEAD\] wall=([0-9.]+)s"
+    else:
+        groups = args.groups if args.groups is not None else args.heads
+        # Validate hybrid constraints
+        if np % groups != 0 or args.heads % groups != 0:
+            return None, None
+        mode = "hybrid"
+        extra = ["--groups", str(groups)]
+        pattern = r"\[HYBRID\] wall=([0-9.]+)s"
+
     cmd = mpirun_cmd(args, np, [
-        "--mode",    "head",
+        "--mode",    mode,
         "--seq-len", str(N),
         "--heads",   str(args.heads),
         "--d-model", str(args.d_model),
         "--no-check",
-    ])
+    ] + extra)
+
     for _ in range(args.repeats):
         try:
             out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
                                           timeout=300).decode()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             continue
-        m = re.search(r"\[HEAD\] wall=([0-9.]+)s", out)
+        m = re.search(pattern, out)
         if m:
             best = min(best, float(m.group(1)))
-    return best if best < float("inf") else None
+    return (best, mode) if best < float("inf") else (None, None)
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
 
@@ -141,13 +170,17 @@ def make_plot(rows, out_path, heads, d_model):
         return
 
     # Organise by (procs, N)
-    by_proc = defaultdict(dict)  # by_proc[procs][N] = time_s
+    by_proc = defaultdict(dict)   # by_proc[procs][N] = time_s
+    mode_of = {}                  # mode_of[procs] = "seq"|"head"|"hybrid"
     for r in rows:
         by_proc[r["procs"]][r["seq_len"]] = r["time_s"]
+        mode_of[r["procs"]] = r["mode"]
 
     all_procs = sorted(by_proc.keys())
     seq_times = by_proc.get(1, {})
     all_N     = sorted({r["seq_len"] for r in rows})
+
+    STYLES = ["-o", "--s", "-.^", ":D", "-v", "--P", "-.h"]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -155,10 +188,17 @@ def make_plot(rows, out_path, heads, d_model):
     for idx, p in enumerate(all_procs):
         times = by_proc[p]
         Ns    = sorted(times)
-        label = "sequential (P=1)" if p == 1 else f"head-parallel (P={p})"
-        style = "-o" if p == 1 else ("--s" if p == 2 else ("-.^" if p == 4 else ":D"))
+        m     = mode_of.get(p, "")
+        if p == 1:
+            label = "sequential (P=1)"
+        elif m == "hybrid":
+            label = f"hybrid (P={p})"
+        else:
+            label = f"head-parallel (P={p})"
+        style = STYLES[idx % len(STYLES)]
         ax1.plot(Ns, [times[n] for n in Ns], style,
-                 label=label, color=PALETTE[idx], linewidth=2, markersize=6)
+                 label=label, color=PALETTE[idx % len(PALETTE)],
+                 linewidth=2, markersize=6)
 
     # Theoretical ideal lines for each P > 1
     for idx, p in enumerate(all_procs):
@@ -167,10 +207,10 @@ def make_plot(rows, out_path, heads, d_model):
         Ns_seq = sorted(seq_times)
         if not Ns_seq:
             continue
-        ideal = [seq_times[n] / p for n in Ns_seq if n in by_proc[p]]
-        Ns_both = [n for n in Ns_seq if n in by_proc[p]]
+        ideal    = [seq_times[n] / p for n in Ns_seq if n in by_proc[p]]
+        Ns_both  = [n for n in Ns_seq if n in by_proc[p]]
         if ideal:
-            ax1.plot(Ns_both, ideal, ":", color=PALETTE[all_procs.index(p)],
+            ax1.plot(Ns_both, ideal, ":", color=PALETTE[idx % len(PALETTE)],
                      alpha=0.4, label=f"ideal P={p} (T_seq/{p})")
 
     ax1.set_xscale("log", base=2)
@@ -188,13 +228,15 @@ def make_plot(rows, out_path, heads, d_model):
         if p == 1:
             continue
         times  = by_proc[p]
+        m      = mode_of.get(p, "")
         Ns     = sorted(n for n in times if n in seq_times and times[n] and seq_times[n])
         speeds = [seq_times[n] / times[n] for n in Ns]
-        style  = "--s" if p == 2 else ("-.^" if p == 4 else ":D")
+        slabel = f"hybrid P={p}" if m == "hybrid" else f"head P={p}"
+        style  = STYLES[idx % len(STYLES)]
         ax2.plot(Ns, speeds, style,
-                 label=f"P={p} speedup", color=PALETTE[idx], linewidth=2, markersize=6)
-        # Ideal
-        ax2.axhline(p, color=PALETTE[idx], linestyle=":", alpha=0.4,
+                 label=slabel, color=PALETTE[idx % len(PALETTE)],
+                 linewidth=2, markersize=6)
+        ax2.axhline(p, color=PALETTE[idx % len(PALETTE)], linestyle=":", alpha=0.4,
                     label=f"ideal P={p}")
 
     ax2.set_xscale("log", base=2)
@@ -253,12 +295,21 @@ def main():
         for p in procs:
             if p == 1:
                 continue
+            groups = args.groups if args.groups is not None else args.heads
+            # Validate before running so we print a clear skip reason
             if p > args.heads:
-                print(f"  N={N:5d}  P={p} skipped (P > num_heads={args.heads})")
-                continue
-            print(f"  N={N:5d}  P={p} (head) ... ", end="", flush=True)
+                if p % groups != 0 or args.heads % groups != 0:
+                    print(f"  N={N:5d}  P={p} skipped "
+                          f"(hybrid needs P%groups==0 and heads%groups==0; "
+                          f"P={p} groups={groups} heads={args.heads})")
+                    continue
+                mode_label = f"hybrid groups={groups}"
+            else:
+                mode_label = "head"
+
+            print(f"  N={N:5d}  P={p} ({mode_label}) ... ", end="", flush=True)
             t0 = time.time()
-            t_par = run_parallel(args, N, p)
+            t_par, mode_used = run_parallel(args, N, p)
             elapsed = time.time() - t0
             if t_par is None:
                 print("FAILED")
@@ -266,7 +317,7 @@ def main():
                 speedup = (t_seq / t_par) if (t_seq and t_par) else float("nan")
                 eff     = speedup / p * 100
                 print(f"{t_par:.4f}s  speedup={speedup:.2f}x  eff={eff:.0f}%  (wall {elapsed:.1f}s)")
-                rows.append({"seq_len": N, "procs": p, "mode": "head",
+                rows.append({"seq_len": N, "procs": p, "mode": mode_used,
                              "time_s": t_par, "speedup": round(speedup, 4)})
         print()
 
@@ -278,13 +329,14 @@ def main():
 
     # Print summary table
     print()
-    print("Summary (speedup = T_seq / T_head_par):")
-    print(f"{'N':>6}  {'P':>4}  {'time':>8}  {'speedup':>8}  {'eff%':>6}")
-    print("-" * 42)
+    print("Summary (speedup = T_seq / T_par):")
+    print(f"{'N':>6}  {'P':>4}  {'mode':>8}  {'time':>10}  {'speedup':>8}  {'eff%':>6}")
+    print("-" * 54)
     for r in rows:
         sp = f"{r['speedup']:.2f}x" if r['procs'] > 1 else "baseline"
         ef = f"{r['speedup']/r['procs']*100:.0f}%" if r['procs'] > 1 else ""
-        print(f"{r['seq_len']:>6}  {r['procs']:>4}  {r['time_s']:>8.4f}s  {sp:>8}  {ef:>6}")
+        print(f"{r['seq_len']:>6}  {r['procs']:>4}  {r['mode']:>8}  "
+              f"{r['time_s']:>10.4f}s  {sp:>8}  {ef:>6}")
 
 
 if __name__ == "__main__":
