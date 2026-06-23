@@ -49,14 +49,18 @@ echo "[3/4] Launching $BIN with $NP processes ..."
 #         network (otherwise MPI may pack all ranks onto the first host) ---
 echo "[4/4] Output:"
 echo "----------------------------------------------------------------"
-mpirun --hostfile "$HOSTFILE" -np "$NP" --map-by node ./"$BIN"
+NET="${NET:-192.168.0.0/24}"   # hotspot/LAN subnet — override with NET=... ; keeps MPI off ZeroTier
+mpirun --prefix /usr \
+       --mca btl_tcp_if_include "$NET" \
+       --mca oob_tcp_if_include "$NET" \
+       --hostfile "$HOSTFILE" -np "$NP" --map-by node ./"$BIN"
 STATUS=$?
 echo "----------------------------------------------------------------"
 
 if [ "$STATUS" -eq 0 ]; then
     echo "RESULT: cluster OK — mpirun completed across the declared nodes."
     echo "        You can now run ./hybrid_attention the same way:"
-    echo "        mpirun --hostfile $HOSTFILE -np $NP ./hybrid_attention --mode hybrid --seq-len 1024"
+    echo "        mpirun --prefix /usr --mca btl_tcp_if_include $NET --mca oob_tcp_if_include $NET --hostfile $HOSTFILE -np $NP ./hybrid_attention --mode hybrid --seq-len 1024"
 else
     echo "RESULT: FAILED (exit $STATUS)."
     echo "        Check, in order:  passwordless SSH  ->  /etc/hosts names  ->"

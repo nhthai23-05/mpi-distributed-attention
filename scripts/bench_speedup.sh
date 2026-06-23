@@ -24,7 +24,10 @@ echo "Running speedup benchmark: N=$INPUT_N (=2*$N), mode=$MODE"
 
 # Sequential baseline (1 process)
 echo "  p=1 (sequential baseline)..."
-mpirun --oversubscribe -np 1 --hostfile "$HOSTFILE" \
+mpirun --oversubscribe --prefix /usr \
+       --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
+       --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
+       -np 1 --hostfile "$HOSTFILE" \
        "$BINARY" --mode seq --seq-len "$INPUT_N" --no-check 2>/dev/null \
     > "$TMP" 2>&1
 T1_WITH=$(grep "\[SEQ\]" "$TMP" | grep -oP 'time=\K[0-9.]+' | head -1)
@@ -37,7 +40,10 @@ echo "1,$INPUT_N,$T1_WITH,$T1_NO,1.00,1.00" >> "$OUT"
 P=2
 while [ "$P" -le "$TOTAL_PROCS" ]; do
     echo "  p=$P ..."
-    mpirun --oversubscribe -np "$P" --hostfile "$HOSTFILE" \
+    mpirun --oversubscribe --prefix /usr \
+           --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
+           --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
+           -np "$P" --hostfile "$HOSTFILE" \
            "$BINARY" --mode "$MODE" --seq-len "$INPUT_N" --csv --no-check 2>/dev/null \
         | grep "^0," > "$TMP"   # take rank 0's row
 

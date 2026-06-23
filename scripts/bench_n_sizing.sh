@@ -20,7 +20,10 @@ echo "rank,seq_len,t_io,t_compute,t_comm" > "$OUT"
 for N in 64 128 256 512 1024 2048 4096 8192; do
     echo "  Running N=$N with $TOTAL_PROCS procs ..."
     # Capture per-rank timings (skip CSV header line)
-    mpirun --oversubscribe -np "$TOTAL_PROCS" --hostfile "$HOSTFILE" \
+    mpirun --oversubscribe --prefix /usr \
+           --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
+           --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
+           -np "$TOTAL_PROCS" --hostfile "$HOSTFILE" \
            "$BINARY" --mode "$MODE" --seq-len "$N" --csv --no-check 2>/dev/null \
         | grep -v "^rank" >> "$OUT"
 

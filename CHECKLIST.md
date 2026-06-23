@@ -9,6 +9,51 @@ Legend:  👤 = only you can do it (needs the physical machines / your password)
 
 ---
 
+## PHASE 0 — VLAN: make the 4 machines reachable (👤 on all 4 machines)
+
+> Goal: every machine gets a **stable virtual IP** and can reach the others by
+> IP, regardless of physical network/NAT. This is the prerequisite for SSH, NFS,
+> and MPI. Do this first.
+>
+> Two options — pick ONE and use it on all 4 machines:
+> - **ZeroTier** (matches this project's `10.147.20.x` example IPs)
+> - **Tailscale** (simpler: no per-node web authorize)
+
+### Option 1 — ZeroTier
+- [ ] On **all 4 machines**, install and join the same network:
+  ```bash
+  curl -s https://install.zerotier.com | sudo bash
+  sudo zerotier-cli join <NETWORK_ID>      # same NETWORK_ID on all 4
+  ```
+- [ ] In **ZeroTier Central** (my.zerotier.com) → your network → **authorize**
+      each of the 4 nodes (tick the checkbox next to each).
+- [ ] On each machine, note its assigned IP (e.g. `10.147.20.x`):
+  ```bash
+  sudo zerotier-cli listnetworks
+  ```
+
+### Option 2 — Tailscale
+- [ ] On **all 4 machines**:
+  ```bash
+  curl -fsSL https://tailscale.com/install.sh | sh
+  sudo tailscale up        # opens a login URL — log ALL 4 into the SAME account
+  ```
+- [ ] On each machine, note its IP (`100.x.y.z`):
+  ```bash
+  tailscale ip -4
+  ```
+
+### Verify
+- [ ] Write down all 4 virtual IPs (master, slave1, slave2, slave3) — you'll put
+      them in `/etc/hosts` in Phase A.
+- [ ] From `master`, `ping <slave1_ip>` succeeds (repeat for slave2, slave3).
+
+> ⚠️ Note: on the VLAN, expect runs to be **slow** — virtual-network overhead can
+> make MPI slower than a single machine. That's normal at this stage; real
+> performance numbers come after migrating to the physical LAN (see end of file).
+
+---
+
 ## PHASE A — Cluster setup (👤 on all 4 machines)
 
 > Goal: 4 machines (`master`, `slave1`, `slave2`, `slave3`) that can talk to each
@@ -112,15 +157,39 @@ Legend:  👤 = only you can do it (needs the physical machines / your password)
 
 ---
 
+## PHASE E (optional) — Migrate VLAN → physical Local LAN (👤)
+
+> For the *real* performance numbers. The VLAN is fine for correctness, but the
+> meaningful speedup/network charts come from a physical Gigabit LAN.
+
+- [ ] Turn off the VLAN service (Tailscale/ZeroTier) or just stop using its IPs.
+- [ ] Connect all 4 machines to the same physical switch; if using VMs, set the
+      network adapter to **Bridged** so each VM gets a LAN IP.
+- [ ] Update `/etc/hosts` on all 4 nodes with the **new physical LAN IPs** for
+      `master`/`slave1`/`slave2`/`slave3`.
+- [ ] Find the bridged network interface name: `ip addr` (e.g. `enp3s0`).
+- [ ] Add the interface flag when running so MPI uses the LAN card (not a
+      leftover VLAN interface):
+  ```bash
+  mpirun --hostfile hostfile --mca btl_tcp_if_include <iface> -np <N> ./hybrid_attention --mode hybrid --seq-len 2048
+  ```
+- [ ] Re-run `bash scripts/test_cluster.sh`, then re-run the Phase C benchmarks
+      on the LAN for the final report numbers.
+
+---
+
 ## Quick status
 
-| Milestone | State |
+| Phase | State |
 |---|---|
 | M1/M2/M3 code | ✅ done & verified |
 | Cluster tooling | ✅ ready (`test_cluster.sh`, `make mpi-prime`, 4-node hostfile) |
-| **Phase A** cluster setup | ⬜ **your turn** |
+| **Phase 0** VLAN setup | ⬜ **start here** |
+| **Phase A** cluster setup (SSH/NFS/OpenMPI) | ⬜ your turn |
+| **Phase B** build & run | ⬜ your turn |
 | **Phase C** benchmark data | ⬜ pending (Claude or you) |
 | **Phase D** report | ⬜ pending (Claude drafts) |
+| **Phase E** migrate to physical LAN | ⬜ optional, for final numbers |
 
 > Full detail: requirements in [`.claude/prds/distributed-attention.prd.md`](.claude/prds/distributed-attention.prd.md),
 > implementation plan in [`.claude/plans/distributed-attention.plan.md`](.claude/plans/distributed-attention.plan.md).

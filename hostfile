@@ -8,10 +8,10 @@
 # master / slave1 / slave2 / slave3 to their IPs (VLAN or LAN).
 #
 # Example below assumes 4 cores per machine — CHANGE to your real core counts:
-master slots=4
-slave1 slots=4
-slave2 slots=4
-slave3 slots=4
+master slots=20
+slave1 slots=8
+slave2 slots=16
+slave3 slots=16
 
 # --- For local testing on this one 20-core machine instead, comment out the
 #     four lines above and uncomment this:
