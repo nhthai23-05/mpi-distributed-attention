@@ -1,0 +1,494 @@
+% =====================================================================
+%  Distributed Multi-Head Attention with Hybrid MPI Parallelism
+%  Parallel & Distributed Programming — project report (draft)
+%
+%  Compile:  pdflatex REPORT.tex   (run twice for the table of contents
+%            and cross-references). Needs a standard TeX Live install.
+%
+%  Charts:   run the benchmarks on the cluster, then
+%            python3 scripts/make_charts.py
+%            which writes results/chart-b-n-sizing.png, chart-c-granularity.png,
+%            chart-d-speedup.png. Until then, this report shows placeholder boxes
+%            in their place (it still compiles).
+%
+%  TODO before submitting: fill every  \TODO{...}  with your measured numbers.
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\sloppy  % prefer slightly loose lines over content spilling into the margin
+
+% --- a clear, portable style for pseudocode (listings is in every TeX Live) ---
+\definecolor{kw}{RGB}{0,0,160}
+\definecolor{cmt}{RGB}{0,128,0}
+\lstdefinestyle{pseudo}{
+  basicstyle=\small\ttfamily,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  mathescape=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=6pt,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=2.4em,
+  breaklines=true,
+  morekeywords={for,each,do,end,if,then,else,return,in,parallel,on,all,broadcast,
+    scatter,gather,allreduce,send,recv,function,Input,Output,to,from,foreach,while}
+}
+\lstset{style=pseudo}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\TODO}[1]{{\color{red}\textbf{[TODO: #1]}}}
+
+% Insert a chart if it exists, otherwise a placeholder box (keeps the report compilable).
+\newcommand{\chartfig}[3]{% #1 = path, #2 = caption, #3 = label
+  \begin{figure}[H]\centering
+  \IfFileExists{#1}{\includegraphics[width=\linewidth]{#1}}{%
+    \fbox{\parbox[c][4.2cm][c]{0.9\linewidth}{\centering
+      \textit{Chart placeholder} --- file \code{#1} not found.\\[2pt]
+      Run the benchmarks, then \code{python3 scripts/make\_charts.py}.}}}
+  \caption{#2}\label{#3}\end{figure}}
+
+\title{\textbf{Distributed Multi-Head Attention}\\[2pt]
+       \large A Hybrid (Task + Data) MPI Parallelization}
+\author{\TODO{your name / student ID / course}}
+\date{\today}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+\noindent
+We parallelize the Transformer \emph{multi-head attention} (MHA) operator,
+$\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\!\big(QK^{\top}/\sqrt{d_k}\big)V$,
+implemented from scratch in C with OpenMPI (no deep-learning frameworks). Three
+strategies are compared against a sequential baseline: \emph{head parallelism}
+(task decomposition), \emph{tensor parallelism} (data decomposition, with a 1D
+row-block path and a 2D Cannon path), and a \emph{hybrid} scheme that splits the
+processes into groups via \code{MPI\_Comm\_split}. We describe the level of
+parallelism, the decomposition and mapping, the communication strategy and
+topology, and load balancing; give pseudocode; and report correctness plus three
+experiments: execution time vs.\ input size $N$, per-process granularity / load
+balance, and speedup as the process count scales.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+\hrule
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+Attention is the central operation of the Transformer architecture. For a
+sequence of $N$ tokens with model dimension $d_{\text{model}}$ split across $H$
+heads (so each head has width $d_k = d_{\text{model}}/H$), each head computes
+\begin{equation}
+\label{eq:attn}
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V,
+\qquad Q,K,V\in\mathbb{R}^{N\times d_k}.
+\end{equation}
+The $H$ head outputs are concatenated to form the $N\times d_{\text{model}}$
+result. The cost is dominated by two matrix products per head --- the
+$N\times N$ score matrix $S=QK^{\top}$ and the $N\times d_k$ output $SV$ --- so a
+single head costs $\mathcal{O}(N^2 d_k)$ and full MHA costs
+$\mathcal{O}(H\,N^2 d_k)$. The quadratic dependence on $N$ is what makes the
+problem worth distributing.
+
+\paragraph{Goal.} Implement MHA in pure C\,+\,MPI, parallelize it across a small
+cluster, verify correctness against a sequential reference, and characterize its
+performance (runtime vs.\ size, load balance, speedup). The code is organized as
+in Table~\ref{tab:files}.
+
+\begin{table}[H]
+\centering\small
+\caption{Source layout.}\label{tab:files}
+\begin{tabular}{@{}ll@{}}
+\toprule
+File & Responsibility \\
+\midrule
+\code{src/tensor.c}          & matrices: \code{matmul}, \code{transpose}, numerically stable softmax \\
+\code{src/attention.c}       & sequential single-head and multi-head attention (ground truth) \\
+\code{src/data\_gen.c}       & deterministic in-memory $Q,K,V$ generation (same on every rank) \\
+\code{src/profiler.c}        & \code{MPI\_Wtime} timers: I/O vs.\ compute vs.\ communication \\
+\code{src/head\_parallel.c}  & M1 --- head parallelism (\code{MPI\_Scatterv}/\code{Gatherv}) \\
+\code{src/tensor\_parallel.c}& M2 --- tensor parallelism: 1D row-block and 2D Cannon \\
+\code{src/hybrid.c}          & M3 --- hybrid (\code{MPI\_Comm\_split} into head groups) \\
+\code{src/progress.c}        & rank-0 progress/ETA meter for long runs \\
+\code{src/main.c}            & CLI, dispatch, correctness check \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Level of parallelism: task vs.\ data}
+% =====================================================================
+The project deliberately implements \textbf{both} classical levels of
+parallelism so they can be compared:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Task (functional) parallelism --- head mode (M1).} The $H$ heads
+are mutually independent computations on disjoint slices of the columns of
+$Q,K,V$. Each head is a self-contained \emph{task}; assigning whole heads to
+different processes is task parallelism.
+\item \textbf{Data parallelism --- tensor mode (M2).} A \emph{single} head is
+distributed by partitioning its data (the rows of $Q$, or 2D blocks of the
+matrices) across processes; every process runs the same code on a different
+portion of the data.
+\item \textbf{Hybrid (M3).} Processes are partitioned into groups; heads are
+distributed across groups (task), and within each group one head at a time is
+distributed by data (tensor). This is task parallelism at the outer level and
+data parallelism at the inner level.
+\end{itemize}
+
+\noindent
+In short: \emph{head mode = task}, \emph{tensor mode = data}, \emph{hybrid =
+task over data}.
+
+% =====================================================================
+\section{Decomposition technique}
+% =====================================================================
+Using the standard taxonomy (data / recursive / exploratory / speculative /
+hybrid), this problem is a combination of \textbf{data decomposition} and
+\textbf{functional (task) decomposition}:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Data decomposition} (tensor mode). The output and intermediate
+data are partitioned and each partition is computed by one process:
+\begin{itemize}
+  \item \emph{1D}: partition the \emph{query rows} --- process $r$ owns a
+        contiguous block of rows of $Q$ and produces the corresponding rows of
+        the output. Softmax is row-wise, so each row is fully local: no
+        reduction is needed across processes.
+  \item \emph{2D (Cannon)}: partition all matrices into a
+        $\sqrt{p}\times\sqrt{p}$ grid of blocks; one block per process.
+\end{itemize}
+\item \textbf{Functional/task decomposition} (head mode). The computation is
+split by \emph{function instances} --- one independent attention computation per
+head.
+\item \textbf{Hybrid} (hybrid mode). Both are combined.
+\end{itemize}
+
+\noindent
+The remaining categories do not apply: there is no recursive subdivision of the
+problem (\emph{recursive}), no search space explored in parallel
+(\emph{exploratory}), and no redundant ``guess-ahead'' work that may be discarded
+(\emph{speculative}).
+
+% =====================================================================
+\section{How the parallelization is implemented}
+% =====================================================================
+
+\subsection{Mapping: process / processor assignment}
+\label{sec:mapping}
+
+\paragraph{Head mode (1D over heads).}
+With $H$ heads and $p$ processes, process $r$ receives
+$\lfloor H/p\rfloor$ consecutive heads, and the last rank takes the remainder
+$H \bmod p$. The root scatters the corresponding $d_k$-wide column slices of each
+row of $Q,K,V$ with \code{MPI\_Scatterv} and collects the results with
+\code{MPI\_Gatherv}.
+
+\paragraph{Tensor mode, 1D (row-block).}
+The $N$ query rows are mapped to $p$ processes in contiguous blocks. With
+$\text{base}=\lfloor N/p\rfloor$ and $\text{rem}=N\bmod p$, the first
+$\text{rem}$ ranks own $\text{base}+1$ rows and the rest own $\text{base}$ rows,
+so any two processes differ by at most one row. Each process holds its block of
+$Q$ (scattered) and \emph{full} $K,V$ (broadcast), and computes its output rows
+entirely locally.
+
+\paragraph{Tensor mode, 2D (Cannon).}
+The processes form a $\sqrt{p}\times\sqrt{p}$ Cartesian grid
+(\code{MPI\_Cart\_create} with periodic dimensions). Each process owns an
+$\frac{N}{\sqrt{p}}\times\frac{d_k}{\sqrt{p}}$ block of $Q$ (and the matching
+blocks of $K^{\top}$ and $V$) --- exactly the
+$n/\sqrt{p}\times n/\sqrt{p}$ block mapping. This path requires $p$ to be a
+perfect square and $N,d_k$ divisible by $\sqrt{p}$.
+
+\paragraph{Hybrid (2D logical grid: groups $\times$ ranks-per-group).}
+\code{MPI\_Comm\_split} partitions \code{MPI\_COMM\_WORLD} into
+$G$ groups of $p/G$ processes (the colour is $\lfloor r/(p/G)\rfloor$). The $H$
+heads are split so each group owns $H/G$ heads (task level); within a group the
+$p/G$ processes run the 1D tensor-parallel kernel on one head at a time (data
+level). The validation in \code{main.c} now enforces $p \bmod G = 0$ and
+$H \bmod G = 0$ so the grid is rectangular.
+
+\subsection{Communication strategy and topology}
+\label{sec:comm}
+
+\paragraph{Master--slave (star).}
+Rank~0 is the master. It owns the full $Q,K,V$, distributes work, and collects
+results. In head and tensor mode this uses the collective
+\code{Scatterv}/\code{Bcast}/\code{Gatherv}; in hybrid mode the master sends each
+group's slice to that group's root with point-to-point
+\code{MPI\_Send}/\code{MPI\_Recv} (tags 10--12) and gathers the results back (tag
+20). Logically this is a star topology centred on rank~0.
+
+\paragraph{Blocking vs.\ non-blocking.}
+All communication is \textbf{blocking}. Collectives
+(\code{MPI\_Bcast}, \code{MPI\_Scatterv}, \code{MPI\_Gatherv},
+\code{MPI\_Allreduce}) and the point-to-point calls
+(\code{MPI\_Send}/\code{MPI\_Recv}, \code{MPI\_Sendrecv\_replace}) all return only
+after the operation has progressed. This keeps the code simple and correct; the
+trade-off (no compute/comm overlap) is discussed in
+Section~\ref{sec:discussion}.
+
+\paragraph{Topologies in use.}
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Tree} --- the MPI collectives (\code{Bcast}, \code{Scatterv},
+\code{Gatherv}, \code{Allreduce}) are realized by the library with tree-based
+algorithms, giving $\mathcal{O}(\log p)$ depth.
+\item \textbf{Ring / 2D torus} --- the Cannon path builds a periodic 2D
+Cartesian communicator and performs the two matrix multiplies as a sequence of
+$\sqrt{p}$ ring shifts using \code{MPI\_Sendrecv\_replace} (rows shift left,
+columns shift up). This is the classic torus communication pattern.
+\item \textbf{Sub-communicator reduction} --- in the Cannon path a single row of
+the score matrix is split across a block-row, so the numerically stable softmax
+is completed with two \code{MPI\_Allreduce} calls (max, then sum) over a
+\emph{row} sub-communicator created by \code{MPI\_Comm\_split}.
+\end{itemize}
+
+\noindent
+Table~\ref{tab:comm} summarizes the primitives per mode.
+\begin{table}[H]
+\centering\small
+\caption{Communication primitives by mode.}\label{tab:comm}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Mode & Distribute & Reduce/exchange & Collect \\
+\midrule
+Head (M1)        & \code{Scatterv}                 & ---                                & \code{Gatherv} \\
+Tensor 1D (M2)   & \code{Scatterv}(Q), \code{Bcast}(K,V) & ---                          & \code{Gatherv} \\
+Tensor Cannon    & 2D block scatter (\code{Send})  & \code{Sendrecv\_replace}, \code{Allreduce} & 2D block gather \\
+Hybrid (M3)      & \code{Comm\_split}, \code{Send} + inner M2 & inner M2                & \code{Recv} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Load balancing}
+\label{sec:loadbal}
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Tensor 1D} is balanced by construction: the remainder rows are
+spread one-each over the first $\text{rem}$ ranks, so process workloads differ by
+at most one row of work --- negligible for large $N$.
+\item \textbf{Head mode} assigns $\lfloor H/p\rfloor$ heads per rank and gives
+the remainder to the \emph{last} rank, so when $H\bmod p\neq 0$ the last rank
+does more work; this is the main source of imbalance in M1 and is visible in the
+granularity experiment (Section~\ref{sec:chartc}).
+\item \textbf{Hybrid} is balanced when $p\bmod G=0$ and $H\bmod G=0$ (now
+enforced); each group then has equal processes and equal heads.
+\end{itemize}
+The granularity benchmark measures the realized balance and flags any pair of
+processes differing by more than $25\%$ (Section~\ref{sec:chartc}).
+
+\subsection{Pseudocode}
+\label{sec:pseudo}
+
+\noindent\textbf{Sequential reference (per head).}
+\begin{lstlisting}
+function ATTENTION(Q, K, V):            # Q,K,V : N x d_k
+    S $\gets$ Q $\cdot$ K$^\top$                      # N x N scores
+    S $\gets$ S / $\sqrt{d_k}$
+    for each row i of S:                # numerically stable softmax
+        m $\gets$ max_j S[i,j]
+        S[i,:] $\gets$ exp(S[i,:] - m); S[i,:] $\gets$ S[i,:] / sum(S[i,:])
+    return S $\cdot$ V                       # N x d_k
+\end{lstlisting}
+
+\noindent\textbf{M2 --- 1D tensor-parallel attention} (the core parallel kernel;
+also used inside hybrid).
+\begin{lstlisting}
+function TP_ATTENTION_1D(Q, K, V) on communicator of p ranks:
+    broadcast N, d_k from rank 0
+    base $\gets$ N / p;  rem $\gets$ N mod p
+    my_rows $\gets$ base + (rank < rem ? 1 : 0)        # 1D row mapping
+    # --- communication ---
+    scatter row-blocks of Q  -> Q_local               # MPI_Scatterv
+    broadcast full K, V to every rank                 # MPI_Bcast
+    # --- computation (entirely local; softmax is per-row) ---
+    for each local row i:
+        for j in 0..N-1: s[j] $\gets$ (Q_local[i] $\cdot$ K[j]) / $\sqrt{d_k}$
+        softmax(s)                                    # local: row is not split
+        O_local[i] $\gets$ s $\cdot$ V                          # row-major accumulation
+    # --- communication ---
+    gather O_local -> O on rank 0                     # MPI_Gatherv
+    return O
+\end{lstlisting}
+
+\noindent\textbf{M2 --- 2D Cannon path} (perfect-square $p$).
+\begin{lstlisting}
+function TP_ATTENTION_CANNON(Q, K, V) on $\sqrt{p}\times\sqrt{p}$ torus:
+    scatter Q, K$^\top$, V into $\sqrt{p}\times\sqrt{p}$ blocks
+    S $\gets$ CANNON_MATMUL(Q_block, Kt_block)         # ring shifts, MPI_Sendrecv_replace
+    S $\gets$ S / $\sqrt{d_k}$
+    DISTRIBUTED_SOFTMAX(S over row sub-comm)          # MPI_Allreduce max, then sum
+    O $\gets$ CANNON_MATMUL(S_block, V_block)
+    gather O blocks -> rank 0
+\end{lstlisting}
+
+\noindent\textbf{M3 --- Hybrid.}
+\begin{lstlisting}
+function HYBRID_MHA(Q, K, V, H heads, G groups) on p ranks:
+    split COMM_WORLD into G groups of p/G ranks       # MPI_Comm_split
+    master (rank 0) sends each group its H/G head-columns   # Send/Recv
+    for each head h owned by my group:                # task level
+        O_h $\gets$ TP_ATTENTION_1D(Q_h, K_h, V_h) on my group  # data level
+    group roots send results back to master           # Send/Recv
+\end{lstlisting}
+
+% =====================================================================
+\section{Profiling methodology}
+% =====================================================================
+Timing uses \code{MPI\_Wtime} through a small profiler that accumulates three
+categories per rank: \textbf{I/O} (input generation), \textbf{compute} (the local
+matrix work), and \textbf{communication} (every MPI call). Each parallel kernel
+brackets its phases with \code{profiler\_start}/\code{profiler\_stop}, so the
+``with communication'' time is $t_{\text{compute}}+t_{\text{comm}}$ and the
+``without communication'' time is $t_{\text{compute}}$ alone. With \code{--csv}
+the program prints one line per rank
+(\code{rank,seq\_len,t\_io,t\_compute,t\_comm}); the benchmark scripts collect
+these into \code{results/*.csv}, which \code{scripts/make\_charts.py} turns into
+the figures below. Long runs can be watched live with \code{--progress}, which
+prints a rank-0 percentage and ETA to \code{stderr}.
+
+% =====================================================================
+\section{Results}
+% =====================================================================
+\TODO{State your cluster: number of machines, cores each, total physical cores
+$X$, network (LAN/VLAN). The experiments below assume processes = physical
+cores.}
+
+\subsection{Correctness verification}
+Every parallel run recomputes the result sequentially on rank~0 and reports the
+maximum absolute difference. The 1D paths reproduce the baseline
+\emph{bitwise} (identical floating-point accumulation order), and the Cannon path
+differs by only $\sim\!10^{-7}$ due to a different summation order --- both well
+under the $10^{-3}$ tolerance.
+\begin{center}\small\ttfamily
+CORRECTNESS PASS\quad max\_err=\TODO{paste measured value}
+\end{center}
+\TODO{Paste the actual program output for head, tensor (1D), tensor \texttt{--cannon},
+and hybrid modes.}
+
+\subsection{Chart B --- execution time vs.\ input size $N$}
+\textbf{Setup.} Processes $=X$ (all physical cores). Sweep
+$N\in\{64,128,\dots\}$ and plot execution time (slowest rank) with and without
+communication. Choose the data size $N^{\star}$ for which the runtime is about
+$2$--$3$ minutes; this $N^{\star}$ is used in the next two experiments. Generate
+with \code{scripts/bench\_n\_sizing.sh} (full command in Appendix~A).
+
+\chartfig{results/chart-b-n-sizing.png}
+  {Execution time vs.\ input size $N$, with and without communication time.}{fig:b}
+
+\noindent\textbf{Observation.} \TODO{Report $N^{\star}$ and the runtime there.}
+Runtime grows roughly quadratically in $N$ (the $\mathcal{O}(N^2)$ term), and the
+gap between the two curves is the communication overhead. \TODO{Comment on how
+large that gap is.}
+
+\subsection{Chart C --- granularity and load balance}
+\label{sec:chartc}
+\textbf{Setup.} $N=N^{\star}$, processes $=X$. Each bar is one process; the stack
+shows its computation time and communication time in different colours. The
+system is balanced if no two processes' totals differ by more than $25\%$.
+Generate with \code{scripts/bench\_granularity.sh} (full command in Appendix~A).
+The script (and \code{make\_charts.py}) print the realized imbalance
+$(\max-\min)/\min$.
+
+\chartfig{results/chart-c-granularity.png}
+  {Per-process computation vs.\ communication time at $N=N^{\star}$.}{fig:c}
+
+\noindent\textbf{Observation.} \TODO{State the measured imbalance \%.} If it
+exceeds $25\%$, adjust granularity: in hybrid mode change \code{--groups} (more
+groups $\Rightarrow$ coarser data parallelism, finer task parallelism) or change
+$N$. Recall the expected imbalance source from Section~\ref{sec:loadbal} (head
+remainder on the last rank; the 1D row split is otherwise near-perfect).
+
+\subsection{Chart D --- speedup}
+\textbf{Setup.} Input size $2N^{\star}$; vary $p=1,2,4,8,\dots,2X$. We measure
+speedup in \textbf{tensor mode}, because a speedup curve requires the
+\emph{same} kernel at every $p$ including the $p=1$ anchor, and the hybrid mode
+cannot run at $p=1$ (it needs $p\ge G$). $T(1)$ is measured with the same
+profiler as $T(p)$, so the with/without-communication speedups are
+apples-to-apples. Generate with \code{scripts/bench\_speedup.sh} (full command in
+Appendix~A).
+
+\chartfig{results/chart-d-speedup.png}
+  {Left: runtime vs.\ $p$ (with / without comm). Right: speedup $T(1)/T(p)$ vs.\
+   $p$, against the ideal linear line.}{fig:d}
+
+\noindent\textbf{Observation.} \TODO{Report the speedup at $p=X$ and $p=2X$.}
+The ``without communication'' curve is closer to ideal; the gap to ``with
+communication'' is the cost of the $K,V$ broadcast and the gather. Beyond
+$p=X$ (oversubscription past physical cores) speedup typically flattens or dips.
+\TODO{Relate the diminishing return to Amdahl's law and the communication share
+measured in Chart~C.}
+
+% =====================================================================
+\section{Discussion: bottlenecks and possible improvements}
+\label{sec:discussion}
+% =====================================================================
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Naive $\mathcal{O}(N^2 d_k)$ kernels.} The matrix multiplies are
+straightforward triple loops (the output accumulation reads $V$ row-by-row for
+cache friendliness). They are not blocked/vectorized like BLAS, so absolute
+times are large; this is acceptable for a parallelism study but bounds
+single-node throughput.
+\item \textbf{Broadcast of full $K,V$.} The 1D path replicates all keys and
+values on every process ($\mathcal{O}(Nd_k)$ per process), which is simple and
+needs no cross-process reduction for softmax, but does not reduce the memory or
+bandwidth per node. For very large $N$ this is the main communication cost.
+\item \textbf{Blocking communication.} There is no overlap of communication with
+computation. Non-blocking \code{MPI\_Isend}/\code{MPI\_Irecv} with computation in
+flight could hide part of the broadcast/gather latency.
+\item \textbf{Master serialization in hybrid.} Rank~0 distributes and collects
+each group's data with point-to-point calls in a loop; for many groups this
+serial fan-out/fan-in is a scaling limit that a collective over a group-root
+sub-communicator would relieve.
+\item \textbf{Busy-wait at 100\% CPU.} OpenMPI spins inside blocking calls, so a
+waiting rank still shows full CPU utilization --- high CPU does not imply useful
+work. This matters when interpreting cluster monitoring during a run.
+\end{itemize}
+
+% =====================================================================
+\section{Conclusion}
+% =====================================================================
+We implemented multi-head attention in C\,+\,MPI and parallelized it three ways:
+head (task), tensor (data; 1D row-block and 2D Cannon), and hybrid
+(task\,$\times$\,data via \code{MPI\_Comm\_split}). All parallel paths reproduce
+the sequential result within tolerance. The experiments characterize runtime vs.\
+problem size, per-process load balance, and speedup with and without
+communication, isolating the cost of communication throughout.
+\TODO{One or two sentences summarizing your measured speedup and load balance.}
+
+% =====================================================================
+\appendix
+\section{Reproducing the results}
+% =====================================================================
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Build:} \code{make} (produces \code{hybrid\_attention}).
+\item \textbf{Cluster:} bring up SSH/NFS/OpenMPI and confirm with
+      \code{bash scripts/test\_cluster.sh} (wait for \code{cluster OK}); see
+      \code{CHECKLIST.md}.
+\item \textbf{Correctness:}
+      \code{mpirun --hostfile hostfile -np $X$ ./hybrid\_attention --mode hybrid --seq-len 1024}.
+\item \textbf{Benchmarks} (set \code{TOTAL\_PROCS} = core count):
+\begin{lstlisting}[numbers=none,mathescape=false]
+TOTAL_PROCS=X  MODE=hybrid bash scripts/bench_n_sizing.sh          # Chart B
+TOTAL_PROCS=X  N=Nstar MODE=hybrid bash scripts/bench_granularity.sh  # Chart C
+TOTAL_PROCS=2X N=Nstar MODE=tensor bash scripts/bench_speedup.sh     # Chart D
+\end{lstlisting}
+\item \textbf{Charts:} \code{python3 scripts/make\_charts.py} (needs
+      \code{python3-matplotlib}); writes the three PNGs this report includes.
+\end{enumerate}
+
+\end{document}

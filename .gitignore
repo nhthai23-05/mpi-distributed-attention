@@ -31,8 +31,23 @@ results/.*tmp*
 # for the report with:  git add -f results/<file>.csv)
 results/*.csv
 
+# Generated charts (regenerable from the CSVs via scripts/make_charts.py;
+# force-add the final ones for the report with: git add -f results/<file>.png)
+results/*.png
+
 # Keep the results/ directory itself in the repo
 !results/.gitkeep
+
+# ───────────────────────────────────────────────────────────────
+# LaTeX report build output (REPORT.tex is the source of truth)
+# ───────────────────────────────────────────────────────────────
+REPORT.pdf
+*.aux
+*.log
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
 
 # ───────────────────────────────────────────────────────────────
 # Editor / OS noise
