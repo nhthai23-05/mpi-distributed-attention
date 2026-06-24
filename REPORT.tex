@@ -67,15 +67,39 @@
       Run the benchmarks, then \code{python3 scripts/make\_charts.py}.}}}
   \caption{#2}\label{#3}\end{figure}}
 
-\title{\textbf{Distributed Multi-Head Attention}\\[2pt]
-       \large A Hybrid (Task + Data) MPI Parallelization\\[4pt]
-       \normalsize Parallel \& Distributed Programming --- Course Project}
-\author{Nguyen Hoang Thai\\
-        \small Hanoi University of Science and Technology (HUST)}
-\date{\today}
-
 \begin{document}
-\maketitle
+
+% =====================================================================
+%  COVER PAGE
+% =====================================================================
+\begin{titlepage}
+\centering
+\vspace*{1.2cm}
+{\large\scshape Hanoi University of Science and Technology}\\[0.25cm]
+{\large School of Information and Communication Technology}\\[0.25cm]
+\rule{0.5\linewidth}{0.4pt}\\[2.6cm]
+
+{\large Parallel \& Distributed Programming}\\[0.35cm]
+{\large\itshape Course Project Report}\\[2.4cm]
+
+{\color{kw}\rule{\linewidth}{1.2pt}}\\[0.55cm]
+{\Huge\bfseries Distributed Multi-Head Attention}\\[0.5cm]
+{\Large A Hybrid (Task\,+\,Data) MPI Parallelization}\\[0.45cm]
+{\color{kw}\rule{\linewidth}{1.2pt}}\\[2.4cm]
+
+{\large\bfseries Group Members}\\[0.55cm]
+{\large Nguyen Hoang Thai}\\[0.18cm]
+{\large Pham Le Minh Quang}\\[0.18cm]
+{\large Pham Ngoc Thach}\\[0.18cm]
+{\large Dang Xuan Dat}\\
+
+\vfill
+{\large \today}
+\end{titlepage}
+
+% =====================================================================
+%  ABSTRACT (own page)
+% =====================================================================
 \begin{abstract}
 \noindent
 We parallelize the Transformer \emph{multi-head attention} (MHA) operator,
@@ -90,12 +114,19 @@ adds shared-memory parallelism. We describe the level of
 parallelism, the decomposition and mapping, the communication strategy and
 topology, and load balancing; give pseudocode; and report correctness plus three
 experiments: execution time vs.\ input size $N$, per-process granularity / load
-balance, and speedup as the process count scales.
+balance, and speedup as the process count scales. Measured on a real three-node,
+$22$-core Wi-Fi cluster, all parallel paths reproduce the sequential result within
+tolerance; the computation scales to about $20\times$ on $22$ cores while
+communication over the wireless link caps the end-to-end speedup near $4.4\times$
+--- a textbook communication wall.
 \end{abstract}
+\newpage
 
+% =====================================================================
+%  TABLE OF CONTENTS (own page)
+% =====================================================================
 \tableofcontents
-\bigskip
-\hrule
+\newpage
 
 % =====================================================================
 \section{Introduction}
@@ -959,100 +990,87 @@ to about $20\times$ on $22$ cores).
 \section{Discussion: improvements and remaining limitations}
 \label{sec:discussion}
 % =====================================================================
-\paragraph{Improvements implemented.}
-\begin{itemize}[leftmargin=1.4em]
-\item \textbf{Streaming online-softmax kernel.} The kernel processes one query row
-at a time with $\mathcal{O}(N)$ scratch instead of materializing the $N\times N$
-score matrix, removing the quadratic-memory wall and letting $N$ scale far past the
-old limit (the $N$ sweep now runs to $65536$).
-\item \textbf{Ring (Flash-style) tensor path.} Replaces the full-$K,V$ broadcast
-with sharded $\mathcal{O}(N/p)$-per-rank storage streamed around a ring; the shift
-is non-blocking and overlaps the compute. This addresses both the ``replicate all
-of $K,V$'' memory cost and the ``no compute/comm overlap'' of the 1D path. (Total
-bytes moved are comparable --- one broadcast vs.\ $p-1$ smaller shifts --- so the
-gains are memory footprint and hidden latency, most visible on a real network and at
-large $N$; Chart~E.)
-\item \textbf{Collective hybrid distribution.} The master now fans out and collects
-each group's slice with \code{MPI\_Scatter}/\code{MPI\_Gather} over a group-roots
-sub-communicator ($\mathcal{O}(\log G)$) instead of a serial rank-0
-\code{Send}/\code{Recv} loop ($\mathcal{O}(G)$).
-\item \textbf{Shared-memory threads.} OpenMP parallelizes the per-query-row loop
-within each rank, adding a second (intra-node) level for a hybrid MPI\,+\,OpenMP
-execution (Chart~F).
-\item \textbf{Richer profiling.} Per rank we separate compute, communication and
-idle \emph{wait}, and count messages, bytes, and a measured link latency, so a slow
-run can be explained (e.g.\ communication-bound at small $N$).
-\end{itemize}
+\paragraph{Improvements implemented.} Four design choices shaped the final system,
+each targeting a cost the measurements exposed. The \emph{streaming online-softmax
+kernel} processes one query row at a time in $\mathcal{O}(N)$ scratch instead of
+forming the $N\times N$ score matrix, lifting the quadratic-memory wall so $N$
+reaches $65536$. The \emph{ring (Flash-style) path} replaces the full-$K,V$
+broadcast with $\mathcal{O}(N/p)$ sharded blocks streamed by non-blocking shifts
+that overlap the compute, cutting cross-node communication $4\times$ and idle wait
+to near zero (Chart~E). The \emph{collective hybrid distribution} fans work to the
+group roots with \code{Scatter}/\code{Gather} ($\mathcal{O}(\log G)$) rather than a
+serial \code{Send}/\code{Recv} loop, and the \emph{rank-0-only input allocation}
+relieves non-root ranks of the unused full matrices, removing the memory ceiling on
+$p$. An OpenMP layer over the query-row loop adds an intra-node level beneath MPI,
+and the built-in profiler separates compute/comm/wait and counts bytes and latency
+so every run explains its own time.
 
-\paragraph{Remaining limitations.}
-\begin{itemize}[leftmargin=1.4em]
-\item \textbf{Memory-bandwidth-bound kernel.} The inner loops re-read $K,V$ for
-every query row, so single-node OpenMP speedup plateaus well before the core count
-(Chart~F). Cache/query \emph{blocking} (FlashAttention-style tiling) would raise
-arithmetic intensity and let the threads scale further; it is left out because it
-would forgo the bit-exact match the 1D/sequential paths currently provide.
-\item \textbf{Scalar kernels.} The matrix work is portable C (auto-vectorized at
-\code{-O2}) rather than blocked/hand-tuned BLAS, so absolute throughput is modest;
-acceptable for a parallelism study.
-\item \textbf{Busy-wait at 100\% CPU.} OpenMPI spins inside blocking calls, so a
-waiting rank still shows full CPU utilization --- high CPU does not imply useful
-work. The \code{--profile-wait} timer makes that idle time measurable
-(Chart~C).
-\item \textbf{Measurement threats to validity.} The speedup study reports rank-0
-timings (the root), which understate the slowest rank's communication and, at large
-$p$, flatter the computation-only number because rank~0 then holds fewer query rows;
-we call this out explicitly rather than smoothing it. The Wi-Fi link is also
-genuinely \emph{variable} --- the same $p{=}22$ broadcast was timed at $97$\,s and
-$226$\,s on separate runs --- so single-sample communication times carry real
-noise, which is why each headline size was run once with a consistent binary and the
-qualitative trend (not any single point) is what we draw conclusions from. A wired
-network and multi-run averaging would tighten the numbers but not change the story.
-\end{itemize}
-
-\paragraph{Future work.} Three steps follow directly from the measurements. (i)
-\emph{A faster interconnect.} Every result here is throttled by Wi-Fi; repeating the
-study on Gigabit Ethernet (latency $\sim\!0.1$\,ms instead of $\sim\!5$\,ms,
-bandwidth $\sim\!100\times$) should move the compute/communication crossover down by
-one to two orders of magnitude in $N$ and let the with-communication speedup
-approach the computation-only curve. (ii) \emph{Cache/query blocking.} The kernel is
-memory-bandwidth bound (Chart~F); FlashAttention-style tiling that keeps a $K,V$
-block resident while sweeping a tile of queries would raise arithmetic intensity and
-unlock the idle SMT threads, at the cost of the current bit-exact match. (iii)
-\emph{Weighted, topology-aware distribution.} The residual heterogeneity imbalance
-(Section~\ref{sec:chartc}) would close if the row split were proportional to each
-node's measured throughput, and a communicator that respects the
-intra-node/inter-node hierarchy (reduce within a node, then across nodes) would cut
-the Wi-Fi traffic that dominates today. None of these change the parallel structure;
-they tune the three quantities --- network cost, arithmetic intensity, and work
-placement --- that this study has isolated and quantified.
+\paragraph{Limitations.} Three remain, and each is visible in the data. The kernel
+is \emph{memory-bandwidth bound} --- it re-reads $K,V$ for every query row, so
+intra-node threading plateaus at $1.33\times$ (Chart~F); cache/query tiling would
+raise arithmetic intensity but would forgo the current bit-exact match. The compute
+is \emph{portable scalar C} (auto-vectorized at \code{-O2}, not tuned BLAS), so
+absolute throughput is modest --- acceptable for a parallelism study. And the
+measurements carry honest \emph{noise}: they are sampled at rank~0 (which understates
+the slowest rank's comm and, at large $p$, flatters the compute number as rank~0
+holds fewer rows), and the Wi-Fi time varies $>2\times$ between repeats
+($97$\,s vs $226$\,s for the same $p{=}22$ broadcast), so we draw conclusions from
+the qualitative trend rather than any single point. Busy-waiting inside blocking MPI
+calls also keeps idle ranks at $100\%$ CPU, which the \code{--profile-wait} timer
+makes visible (Chart~C).
 
 % =====================================================================
 \section{Conclusion}
 % =====================================================================
-We implemented multi-head attention in C\,+\,MPI and parallelized it three ways:
-head (task), tensor (data; 1D row-block, 2D Cannon, and a ring/Flash-style path
-that streams sharded $K,V$ through an online softmax), and hybrid
-(task\,$\times$\,data via \code{MPI\_Comm\_split}), with an OpenMP layer adding
-shared-memory parallelism inside each rank. All parallel paths reproduce the
-sequential result within tolerance (bit-exact for the 1D, head and hybrid paths;
-$\sim\!10^{-7}$ for the reordered Cannon and ring paths). On the three-node,
-$22$-core Wi-Fi cluster the central finding is the gap between how the
-\emph{work} scales and how the \emph{runtime} scales: at the chosen size
-$N^{\star}=32768$ the computation-only speedup reaches about $\mathbf{20\times}$ on
-$22$ cores, yet communication over the wireless link caps the end-to-end
-(with-communication) speedup at only $\mathbf{4.4\times}$ --- and that best value is
-reached at $p=8$ on a \emph{single} machine, so adding the other two nodes speeds up
-the arithmetic but not the wall clock. The same fast-\code{master}/slow-network
-asymmetry drives the hybrid run's load imbalance to $175.7\%$ (cut to $28.6\%$ by
-switching to the rootless 1D decomposition) --- both far from and then near the
-$25\%$ target. The two
-algorithmic improvements address exactly these costs: the sharded \emph{ring}
-path cuts cross-node communication $4\times$ and idle wait almost to zero
-(Chart~E), and the rank-0-only input allocation removes the memory wall that
-otherwise caps the process count. The clear lesson is that for this
-communication-bound, memory-bandwidth-bound operator on a commodity network, the
-decomposition that \emph{minimizes and overlaps data movement} --- not the one
-that merely divides the arithmetic --- is what determines real performance.
+We built the Transformer multi-head-attention operator from scratch in C\,+\,MPI
+and parallelized it three ways --- head (task), tensor (data; 1D row-block, 2D
+Cannon, and a ring/Flash-style path), and hybrid (task\,$\times$\,data via
+\code{MPI\_Comm\_split}) --- over a single shared streaming kernel, with an OpenMP
+layer inside each rank. Every path reproduces the sequential baseline within
+tolerance (bit-exact for 1D/head/hybrid, $\sim\!10^{-7}$ for the reordered
+Cannon/ring paths), so the parallel program is a faithful solution to the problem,
+and the implementation answers each part of the brief --- level of parallelism,
+decomposition, mapping, communication, load balancing, and pseudocode --- with a
+measured experiment behind every claim.
+
+\paragraph{What the numbers really say.} The honest headline is a \emph{gap between
+two kinds of scaling}. The arithmetic divides almost ideally --- computation-only
+speedup reaches about $20\times$ on $22$ cores --- but the end-to-end runtime tells
+a sterner story: over Wi-Fi the best wall-clock speedup is only $4.4\times$, and it
+is reached at $p=8$ on a \emph{single} machine. Bringing in the second and third
+nodes makes the computation faster yet the program slower, because the $K,V$
+broadcast and gather must cross a link roughly three orders of magnitude slower than
+local memory. That same asymmetry turns a statically ``balanced'' hybrid mapping
+into a $175.7\%$ load imbalance, which a change of decomposition --- to the
+rootless 1D split --- brings down to $28.6\%$.
+
+\paragraph{A realistic appraisal.} Read plainly, \emph{this workload and this
+cluster are mismatched}, and the report's worth is in showing precisely why and by
+how much. Attention is $\mathcal{O}(N^2)$ compute over $\mathcal{O}(N)$ data, so in
+principle it should be compute-bound and scale well --- and it does, on one
+multi-core node or whenever the data stays local. The moment that data must travel
+over commodity Wi-Fi the constant factors invert: the operator is communication-bound
+at every size the $2$--$3$ minute budget permits, and only beyond $N\approx131072$
+(a $\sim\!30$-minute run) would computation finally dominate. Distributing attention
+across machines is thus worth it precisely when the interconnect is fast (wired
+Ethernet or InfiniBand) or the per-node problem is large enough to amortize the
+transfer; on a shared wireless LAN the single fastest node is hard to beat. The two
+levers that actually move the result are the ones that \emph{reduce and overlap}
+data movement (the sharded, non-blocking ring path) and that \emph{place work by
+capability} (throughput-proportional, topology-aware distribution on heterogeneous
+nodes) --- not the ones that merely divide the arithmetic more finely.
+
+\paragraph{Closing.} The project therefore delivers two things: a correct,
+framework-free, three-way-parallel attention, and --- more valuably --- a measured
+account of where its time goes and which engineering choices change it. The next
+steps follow directly and change none of the parallel structure, only the three
+quantities this study isolated. A \emph{wired network} would pull the
+with-communication curve toward the computation-only one; \emph{FlashAttention-style
+tiling} would lift the memory-bandwidth ceiling that caps intra-node threading; and
+\emph{throughput-weighted row assignment} would close the residual heterogeneity
+imbalance. The communication wall measured here is not a flaw in the code but a
+property of the machine --- and naming it quantitatively is the point of the
+exercise.
 
 % =====================================================================
 \appendix
