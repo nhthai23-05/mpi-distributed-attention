@@ -74,3 +74,6 @@ Thumbs.db
 
 # NOTE: do NOT ignore Makefile, hostfile, scripts/, src/, or *.md —
 # those are all part of the project and must be committed.
+
+# archive artifacts
+*.zip

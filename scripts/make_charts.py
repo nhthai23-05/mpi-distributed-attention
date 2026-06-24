@@ -115,10 +115,18 @@ def chart_c(results_dir):
     ax.grid(True, axis="y", ls=":", alpha=0.5)
     ax.legend()
 
-    lo, hi = min(totals), max(totals)
+    # Load imbalance is measured on the WORK each rank does (compute+comm), not on
+    # the total wall (compute+comm+wait): with --profile-wait the barriers equalize
+    # the wall time (the wait segment just fills the gap), so total-wall imbalance is
+    # trivially ~0. The brief's question — does the *idle* time differ by >25%? — is
+    # answered by how uneven the work is, which the red wait segments then visualize.
+    work = [c + m for c, m in zip(comp, comm)]
+    lo, hi = min(work), max(work)
     imbalance = (hi - lo) / lo * 100 if lo > 0 else 0.0
     verdict = "BALANCED (<=25%)" if imbalance <= 25 else "IMBALANCED (>25%) — adjust granularity"
-    note = f"load imbalance (max-min)/min = {imbalance:.1f}%  -> {verdict}"
+    note = f"work (compute+comm) imbalance (max-min)/min = {imbalance:.1f}%  -> {verdict}"
+    if has_wait:
+        note += "\nred = idle wait (fast ranks blocked at barriers for slow ones)"
     if sum(msgs) or sum(byts):
         note += (f"\ntransfers this run: {sum(msgs)} msgs, "
                  f"{sum(byts)/1e6:.1f} MB total across {len(ranks)} ranks")

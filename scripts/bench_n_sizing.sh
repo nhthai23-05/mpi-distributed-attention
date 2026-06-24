@@ -16,7 +16,7 @@ export LC_ALL=C
 # reflect pure MPI process scaling. Override with OMP_NUM_THREADS=N for hybrid runs.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
-BINARY="./hybrid_attention"
+BINARY="${BINARY:-./hybrid_attention}"
 MODE="${MODE:-hybrid}"
 TOTAL_PROCS="${TOTAL_PROCS:-4}"
 HOSTFILE="${HOSTFILE:-hostfile}"

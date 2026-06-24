@@ -20,7 +20,7 @@ export LC_ALL=C
 # Override with OMP_NUM_THREADS=N to measure the hybrid MPI+OpenMP speedup.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
-BINARY="./hybrid_attention"
+BINARY="${BINARY:-./hybrid_attention}"
 MODE="${MODE:-tensor}"
 TOTAL_PROCS="${TOTAL_PROCS:-4}"
 HOSTFILE="${HOSTFILE:-hostfile}"
@@ -62,15 +62,32 @@ T1_NO="$T1_COMPUTE"
 echo "    t1_compute=${T1_COMPUTE}s  t1_comm=${T1_COMM}s"
 echo "1,$INPUT_N,$T1_WITH,$T1_NO,1.00,1.00,${T1_MSGS:-0},${T1_BYTES:-0},${T1_LAT:-0}" >> "$OUT"
 
-# Parallel runs: vary p = 2, 4, 8, ..., up to TOTAL_PROCS
-P=2
-while [ "$P" -le "$TOTAL_PROCS" ]; do
-    echo "  p=$P ..."
+# Parallel runs: explicit process list so we hit X (= physical cores) and 2X
+# exactly, not only powers of two. Override with PLIST="2 4 8 ...".
+# HOSTFILE_BIG (if set) is used for any P above PHYS_CORES (oversubscription):
+# it caps the small-RAM node so a 2*N run does not OOM it.
+PLIST="${PLIST:-2 4 8 16 22 44}"
+# Rough per-rank footprint (MB) for tensor mode at this size: full Q,K,V,out at
+# d_model plus the single-head kernel buffers ~ INPUT_N * 13312 bytes.
+PERMEM_MB=$(( INPUT_N * 13312 / 1048576 ))
+for P in $PLIST; do
+    [ "$P" -gt "$TOTAL_PROCS" ] && continue
+    # Memory guard: skip any P whose aggregate footprint would exhaust cluster RAM
+    # (default 24 GB across the 3 nodes), so a 2*N run cannot OOM/thrash a node.
+    if [ $(( P * PERMEM_MB )) -gt "${CLUSTER_MB:-24000}" ]; then
+        echo "  p=$P  SKIP — est ${PERMEM_MB}MB/rank x $P > ${CLUSTER_MB:-24000}MB cluster RAM"
+        continue
+    fi
+    HF="$HOSTFILE"
+    if [ -n "${HOSTFILE_BIG:-}" ] && [ "$P" -gt "${PHYS_CORES:-22}" ]; then
+        HF="$HOSTFILE_BIG"
+    fi
+    echo "  p=$P  (hostfile=$HF) ..."
     step_start=$SECONDS
     mpirun --oversubscribe --prefix /usr \
            --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
            --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
-           -np "$P" --hostfile "$HOSTFILE" \
+           -np "$P" --hostfile "$HF" \
            "$BINARY" --mode "$MODE" --seq-len "$INPUT_N" --csv --no-check 2>/dev/null \
         | grep "^0," > "$TMP"   # take rank 0's row
     echo "    (wall $(( SECONDS - step_start ))s)"
@@ -92,8 +109,6 @@ while [ "$P" -le "$TOTAL_PROCS" ]; do
     echo "    t_wall(no_comm)  =${T_NO}s    speedup=${SP_NO}"
     echo "    packets=${T_MSGS:-0}  bytes=${T_BYTES:-0}  link_latency=${T_LAT:-0}us"
     echo "$P,$INPUT_N,$T_WITH,$T_NO,$SP_WITH,$SP_NO,${T_MSGS:-0},${T_BYTES:-0},${T_LAT:-0}" >> "$OUT"
-
-    P=$((P * 2))
 done
 
 rm -f "$TMP"

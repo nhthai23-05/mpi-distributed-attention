@@ -13,7 +13,7 @@
 export LC_ALL=C
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
-BINARY="./hybrid_attention"
+BINARY="${BINARY:-./hybrid_attention}"
 TOTAL_PROCS="${TOTAL_PROCS:-4}"
 HOSTFILE="${HOSTFILE:-hostfile}"
 N="${N:-2048}"

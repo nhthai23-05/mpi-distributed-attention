@@ -154,13 +154,21 @@ int main(int argc, char **argv) {
     profiler_enable_wait(profile_wait);
     progress_enable(show_progress);
 
-    /* Allocate Q, K, V on all ranks (data_gen makes them identical everywhere) */
-    Tensor Q = tensor_alloc(seq_len, d_model);
-    Tensor K = tensor_alloc(seq_len, d_model);
-    Tensor V = tensor_alloc(seq_len, d_model);
+    /* The full Q,K,V are used on rank 0 only: in every parallel mode rank 0 holds
+     * the input, scatters each rank its slice, and gathers the result, while the
+     * other ranks receive their slices and learn the dimensions via MPI_Bcast
+     * inside each kernel. Allocating (and generating) these full N x d_model
+     * matrices on every rank would waste O(N*d_model) memory per rank for data
+     * that is never read there — which is exactly what caps N and the process
+     * count on a memory-limited node. So allocate them at full size on rank 0 and
+     * as empty tensors elsewhere. */
+    int root_rows = (rank == 0) ? seq_len : 0;
+    Tensor Q = tensor_alloc(root_rows, d_model);
+    Tensor K = tensor_alloc(root_rows, d_model);
+    Tensor V = tensor_alloc(root_rows, d_model);
 
     profiler_start(TIMER_IO);
-    data_gen_fill(&Q, 1);
+    data_gen_fill(&Q, 1);   /* no-op on non-root ranks (zero rows) */
     data_gen_fill(&K, 2);
     data_gen_fill(&V, 3);
     profiler_stop(TIMER_IO);
@@ -171,10 +179,11 @@ int main(int argc, char **argv) {
     if (mode != MODE_SEQ)
         profiler_measure_latency(MPI_COMM_WORLD);
 
-    /* Sequential baseline (rank 0 only, for correctness check) */
-    Tensor out_seq = tensor_alloc(seq_len, d_model);
-    Tensor out_par = tensor_alloc(seq_len, d_model);
-    tensor_zero(&out_par);
+    /* Baseline + result tensors are likewise only needed (and written) on rank 0,
+     * which performs the correctness comparison; allocate them empty elsewhere. */
+    Tensor out_seq = tensor_alloc(root_rows, d_model);
+    Tensor out_par = tensor_alloc(root_rows, d_model);
+    if (rank == 0) tensor_zero(&out_par);
 
     if (rank == 0 && (do_check || mode == MODE_SEQ)) {
         double t0 = MPI_Wtime();

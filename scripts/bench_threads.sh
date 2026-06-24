@@ -12,7 +12,7 @@
 
 export LC_ALL=C
 
-BINARY="./hybrid_attention"
+BINARY="${BINARY:-./hybrid_attention}"
 N="${N:-2048}"
 MAX_THREADS="${MAX_THREADS:-$(nproc)}"
 RESULTS_DIR="results"

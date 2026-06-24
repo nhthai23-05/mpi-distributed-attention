@@ -1,0 +1,8 @@
+# Oversubscription hostfile — used ONLY for speedup points P > 22 (= 2X).
+# slave1 has just 4 GB RAM, so it is capped at its 4 physical cores (no
+# oversubscription there) to avoid OOM at the 2*N speedup size. The extra
+# oversubscribed ranks land on master (16 GB) and slave2 (15 GB) instead.
+#   sum of slots = 44 = 2X, so -np 44 fills: master 20, slave1 4, slave2 20.
+master slots=20
+slave1 slots=4
+slave2 slots=20

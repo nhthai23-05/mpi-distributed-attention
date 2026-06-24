@@ -7,11 +7,14 @@
 # These names must resolve — make sure /etc/hosts on every node maps
 # master / slave1 / slave2 / slave3 to their IPs (VLAN or LAN).
 #
-# Example below assumes 4 cores per machine — CHANGE to your real core counts:
-master slots=20
-slave1 slots=8
-slave2 slots=16
-slave3 slots=16
+# Real cluster (physical-core counts, measured with lscpu):
+#   master  = 8 physical / 16 logical  (AMD Ryzen 7 7840H)
+#   slave1  = 4 physical /  8 logical  (Intel, ASUS VivoBook)
+#   slave2  = 10 physical / 16 logical (Intel hybrid P+E, ASUS TUF)
+#   total   = 22 physical cores
+master slots=8
+slave1 slots=4
+slave2 slots=10
 
 # --- For local testing on this one 20-core machine instead, comment out the
 #     four lines above and uncomment this:

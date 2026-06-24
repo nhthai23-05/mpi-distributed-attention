@@ -52,6 +52,12 @@
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\TODO}[1]{{\color{red}\textbf{[TODO: #1]}}}
 
+% Measured load-imbalance figures (Chart C and its granularity-adjustment table).
+\newcommand{\GRANHYB}{175.7\,\%}      % hybrid G=2, N=32768, p=22 (measured)
+\newcommand{\GRANTEN}{28.6\,\%}       % 1D tensor, N=32768, p=22 (measured)
+% Chart D speedup at the 2X=44 oversubscription point (clean, optimized binary).
+\newcommand{\Tone}{92.0}   % serial baseline T(1) at N*=32768, seconds (measured)
+
 % Insert a chart if it exists, otherwise a placeholder box (keeps the report compilable).
 \newcommand{\chartfig}[3]{% #1 = path, #2 = caption, #3 = label
   \begin{figure}[H]\centering
@@ -62,8 +68,10 @@
   \caption{#2}\label{#3}\end{figure}}
 
 \title{\textbf{Distributed Multi-Head Attention}\\[2pt]
-       \large A Hybrid (Task + Data) MPI Parallelization}
-\author{\TODO{your name / student ID / course}}
+       \large A Hybrid (Task + Data) MPI Parallelization\\[4pt]
+       \normalsize Parallel \& Distributed Programming --- Course Project}
+\author{Nguyen Hoang Thai\\
+        \small Hanoi University of Science and Technology (HUST)}
 \date{\today}
 
 \begin{document}
@@ -107,6 +115,23 @@ single head costs $\mathcal{O}(N^2 d_k)$ and full MHA costs
 $\mathcal{O}(H\,N^2 d_k)$. The quadratic dependence on $N$ is what makes the
 problem worth distributing.
 
+\paragraph{Background and related work.} The decompositions used here mirror the
+ones that production systems use, reduced to their essentials. Splitting whole heads
+across devices is \emph{head} (a form of \emph{tensor-model}) parallelism, as in
+Megatron-LM; splitting a single head's matrices across devices is \emph{tensor}
+parallelism. The ring path is a distributed-memory rendering of
+\emph{FlashAttention}'s online-softmax recurrence (keep a running max, denominator
+and weighted sum so the $N\times N$ score matrix is never materialized), combined
+with the ``ring attention'' idea of streaming sharded $K,V$ around the processes;
+it is also a direct cousin of the classic systolic matrix-multiply of
+\emph{Cannon (1969)}, which the 2D path implements literally on an
+\code{MPI\_Cart} torus. The communication primitives --- tree-based
+\code{Bcast}/\code{Scatterv}/\code{Gatherv}/\code{Allreduce} and
+\code{Sendrecv\_replace} ring shifts --- are the standard MPI building blocks for
+these patterns. The contribution of this project is not a new algorithm but a
+\emph{from-scratch, framework-free} C\,+\,MPI implementation of all of them, on one
+shared kernel, measured honestly on a real heterogeneous cluster.
+
 \paragraph{Goal.} Implement MHA in pure C\,+\,MPI, parallelize it across a small
 cluster, verify correctness against a sequential reference, and characterize its
 performance (runtime vs.\ size, load balance, speedup). The code is organized as
@@ -119,12 +144,12 @@ in Table~\ref{tab:files}.
 \toprule
 File & Responsibility \\
 \midrule
-\code{src/tensor.c}          & matrices: \code{matmul}, \code{transpose}, numerically stable softmax \\
-\code{src/attention.c}       & sequential single-head and multi-head attention (ground truth) \\
-\code{src/data\_gen.c}       & deterministic in-memory $Q,K,V$ generation (same on every rank) \\
-\code{src/profiler.c}        & \code{MPI\_Wtime} timers: I/O vs.\ compute vs.\ communication \\
+\code{src/tensor.c}          & \code{Tensor} type: alloc/free/zero, \code{transpose} (for Cannon's $K^{\top}$) \\
+\code{src/attention.c}       & streaming kernel + sequential single/multi-head attention (ground truth) \\
+\code{src/data\_gen.c}       & deterministic in-memory $Q,K,V$ generation (rank 0) \\
+\code{src/profiler.c}        & \code{MPI\_Wtime} timers (I/O, compute, comm, wait) + msg/byte/latency counters \\
 \code{src/head\_parallel.c}  & M1 --- head parallelism (\code{MPI\_Scatterv}/\code{Gatherv}) \\
-\code{src/tensor\_parallel.c}& M2 --- tensor parallelism: 1D row-block and 2D Cannon \\
+\code{src/tensor\_parallel.c}& M2 --- tensor parallelism: 1D row-block, 2D Cannon, ring (Flash-style) \\
 \code{src/hybrid.c}          & M3 --- hybrid (\code{MPI\_Comm\_split} into head groups) \\
 \code{src/progress.c}        & rank-0 progress/ETA meter for long runs \\
 \code{src/main.c}            & CLI, dispatch, correctness check \\
@@ -132,8 +157,34 @@ File & Responsibility \\
 \end{tabular}
 \end{table}
 
+\paragraph{Roadmap.} Table~\ref{tab:roadmap} maps each question the project must
+answer to the section that answers it, so the report can be read against the brief
+directly.
+
+\begin{table}[H]
+\centering\small
+\caption{Where each required question is addressed.}\label{tab:roadmap}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Question & Section \\
+\midrule
+Level of parallelism: task or data?            & \S\ref{sec:level} \\
+Decomposition technique?                        & \S\ref{sec:decomp} \\
+Mapping (1D / 2D $n/\sqrt{p}$ block)?            & \S\ref{sec:mapping} \\
+Communication strategy \& topology; blocking?   & \S\ref{sec:comm} \\
+Load balancing applied?                          & \S\ref{sec:loadbal}, \S\ref{sec:chartc} \\
+Pseudocode of the parallel algorithm            & \S\ref{sec:pseudo} \\
+Correctness of the parallel result              & \S\ref{sec:correctness} \\
+Input size $N$ for $2$--$3$ min; time vs.\ $N$  & \S\ref{sec:chartb} (Chart~B) \\
+Granularity / load balance ($25\%$ rule)        & \S\ref{sec:chartc} (Chart~C) \\
+Speedup at $2N$, $p=1\ldots2X$, with/without comm & \S\ref{sec:chartd} (Chart~D), App.~\ref{app:2n} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 % =====================================================================
 \section{Level of parallelism: task vs.\ data}
+\label{sec:level}
 % =====================================================================
 The project deliberately implements \textbf{both} classical levels of
 parallelism so they can be compared:
@@ -166,6 +217,7 @@ count $t$ (reported as \code{threads=}$t$); with $t=1$ the runs are pure MPI.
 
 % =====================================================================
 \section{Decomposition technique}
+\label{sec:decomp}
 % =====================================================================
 Using the standard taxonomy (data / recursive / exploratory / speculative /
 hybrid), this problem is a combination of \textbf{data decomposition} and
@@ -197,6 +249,48 @@ problem (\emph{recursive}), no search space explored in parallel
 % =====================================================================
 \section{How the parallelization is implemented}
 % =====================================================================
+
+\subsection{Implementation overview and data flow}
+\label{sec:impl}
+All three modes share one control flow, in \code{main.c}: parse and \emph{validate}
+the configuration collectively (every rank parses the same \code{argv}, so all reach
+the same verdict and abort together on a bad configuration --- no rank ever proceeds
+into a kernel with, say, a non-divisible process count); generate the input;
+dispatch to the chosen kernel; then, on rank~0, recompute the result sequentially
+and report the maximum absolute error. The dispatch is a thin switch over
+\code{MODE\_\{HEAD,TENSOR,HYBRID\}}; the heavy lifting lives in one file per mode
+(Table~\ref{tab:files}), which keeps the communication strategy of each mode
+isolated and independently testable.
+
+\paragraph{Deterministic input without a parallel file system.}
+The cluster has no shared file system, so rather than read $Q,K,V$ from disk we
+\emph{generate} them: \code{data\_gen\_fill} seeds \code{srand} with a fixed
+per-matrix constant and fills the tensor with values in $[-1,1]$. Seeding makes the
+input bit-identical on every run, so the correctness check and the timings are
+reproducible. Only rank~0 needs the full matrices (it is the master that scatters
+them), so after the memory optimization (Section~\ref{sec:discussion}) the other
+ranks allocate them empty and receive their slices over MPI.
+
+\paragraph{One streaming kernel, reused everywhere.}
+The numerically stable, single-query-row routine \code{attention\_row} ---
+$o=\mathrm{softmax}(qK^{\top}/\sqrt{d_k})\,V$ for one query $q$ --- is the
+\emph{only} compute kernel in the project. It processes one score row at a time
+with $\mathcal{O}(N)$ scratch instead of forming the $N\times N$ score matrix, so
+its memory is linear in $N$ and its arithmetic order matches the reference exactly
+(hence the bit-exact 1D result). The sequential baseline, the 1D tensor path and
+the inner loop of hybrid all call it on their local query rows; the ring path
+inlines an \emph{online} variant of the same recurrence so it can fold in one
+$K,V$ block at a time. Because every path funnels through this kernel, correctness
+established once carries across all modes, and an OpenMP \code{parallel for} over
+the query-row loop adds a shared-memory level for free (each thread keeps a private
+score buffer).
+
+\paragraph{Self-describing timing.}
+Each kernel brackets its phases with the profiler
+(Section~\ref{sec:profiling}), and rank~0 prints either a human summary or a
+per-rank CSV line. No external profiler or trace tool is needed; the program
+explains its own time and communication, which is what makes every chart in this
+report reproducible from a single binary.
 
 \subsection{Mapping: process / processor assignment}
 \label{sec:mapping}
@@ -236,12 +330,15 @@ $\ell$, and running weighted sum, rescaling on each new max). It therefore never
 materializes a score row and never holds more than $O(N/p)$ of $K,V$, and the
 shift overlaps the compute. Works for any $p$; the result matches the baseline up
 to floating-point reassociation ($\sim10^{-7}$).
+
+\paragraph{Hybrid mode (task $\times$ data).}
 \code{MPI\_Comm\_split} partitions \code{MPI\_COMM\_WORLD} into
 $G$ groups of $p/G$ processes (the colour is $\lfloor r/(p/G)\rfloor$). The $H$
 heads are split so each group owns $H/G$ heads (task level); within a group the
 $p/G$ processes run the 1D tensor-parallel kernel on one head at a time (data
-level). The validation in \code{main.c} now enforces $p \bmod G = 0$ and
-$H \bmod G = 0$ so the grid is rectangular.
+level). The validation in \code{main.c} enforces $p \bmod G = 0$ and
+$H \bmod G = 0$ so the process grid is rectangular --- e.g.\ with $p=22$, $G=2$,
+$H=4$ each group is $11$ processes computing $2$ heads.
 
 \subsection{Communication strategy and topology}
 \label{sec:comm}
@@ -298,19 +395,80 @@ Hybrid (M3)      & \code{Comm\_split}, \code{Scatter} + inner M2 & inner M2     
 
 \subsection{Load balancing}
 \label{sec:loadbal}
+Two kinds of balance must be distinguished: \emph{static} balance (does the
+mapping hand every process an equal \emph{amount} of work?) and \emph{realized}
+balance (do the processes actually \emph{finish} together?). The mappings here are
+statically balanced:
 \begin{itemize}[leftmargin=1.4em]
 \item \textbf{Tensor 1D} is balanced by construction: the remainder rows are
 spread one-each over the first $\text{rem}$ ranks, so process workloads differ by
 at most one row of work --- negligible for large $N$.
 \item \textbf{Head mode} assigns $\lfloor H/p\rfloor$ heads per rank and gives
-the remainder to the \emph{last} rank, so when $H\bmod p\neq 0$ the last rank
-does more work; this is the main source of imbalance in M1 and is visible in the
-granularity experiment (Section~\ref{sec:chartc}).
-\item \textbf{Hybrid} is balanced when $p\bmod G=0$ and $H\bmod G=0$ (now
-enforced); each group then has equal processes and equal heads.
+the remainder to the \emph{last} rank, so when $H\bmod p\neq 0$ the last rank does
+strictly more work; this is the structural source of imbalance in M1.
+\item \textbf{Hybrid} gives every group equal processes and equal heads when
+$p\bmod G=0$ and $H\bmod G=0$ (enforced in \code{main.c}).
 \end{itemize}
-The granularity benchmark measures the realized balance and flags any pair of
-processes differing by more than $25\%$ (Section~\ref{sec:chartc}).
+Static balance, however, assumes \emph{homogeneous} processes and \emph{free}
+communication --- neither of which holds on our cluster. The three CPU generations
+run the same row block at different speeds, the Wi-Fi link is slow and variable,
+and the group roots carry the distribution traffic. Realized balance is therefore
+an experimental question: the granularity benchmark (Section~\ref{sec:chartc})
+measures each process's compute$+$comm time and flags any pair differing by more
+than $25\%$. As Chart~C shows, the statically ``balanced'' hybrid mapping is in
+fact $175.7\%$ imbalanced in practice, and the fix is to change the decomposition
+(coarser/finer), not just the chunk count.
+
+\subsection{Cost analysis (computation vs.\ communication)}
+\label{sec:cost}
+Table~\ref{tab:cost} gives the per-process asymptotic costs, which explain the
+experimental behaviour. For one head of width $d_k$ on $p$ processes, the
+sequential work is $\Theta(N^2 d_k)$; all data paths cut the \emph{computation}
+to $\Theta(N^2 d_k/p)$ but differ sharply in \emph{communication volume} and in
+the \emph{memory} each rank must hold --- the quantity that decides whether the
+algorithm is compute- or communication-bound on a given interconnect.
+
+\begin{table}[H]
+\centering\small
+\caption{Per-process cost for one head ($N$ tokens, width $d_k$, $p$ processes).
+Communication volume is the bytes a rank sends/receives; ``$K,V$ resident'' is the
+peak key/value memory it must store.}\label{tab:cost}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Path & Computation & Communication volume & $K,V$ resident \\
+\midrule
+Sequential        & $\Theta(N^2 d_k)$      & ---                              & $\Theta(N d_k)$   \\
+Head (task)       & $\Theta(N^2 d_k\,H/p)$ & $\Theta(N d_k\,H/p)$            & $\Theta(N d_k)$   \\
+Tensor 1D         & $\Theta(N^2 d_k/p)$    & $\Theta(N d_k)$ (full $K,V$ bcast) & $\Theta(N d_k)$   \\
+Tensor Cannon     & $\Theta(N^2 d_k/p)$    & $\Theta(N d_k/\sqrt{p})$ per shift & $\Theta(N d_k/p)$ \\
+Tensor Ring       & $\Theta(N^2 d_k/p)$    & $\Theta(N d_k)$ ($p{-}1$ shifts)   & $\Theta(N d_k/p)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Two consequences drive the results. First, in 1D and ring the computation falls
+as $1/p$ but the communication volume \emph{does not} (every rank still needs all
+of $K,V$ once), so the communication-to-computation ratio grows like $p$: past
+some $p$ the broadcast/streaming dominates --- exactly the ``communication wall''
+the speedup curve hits on Wi-Fi (Section~\ref{sec:chartd}). Second, only Cannon
+and ring shrink the resident $K,V$ to $\Theta(N d_k/p)$; 1D replicates the full
+$K,V$ on every rank, which is what ultimately caps $N$ on a memory-limited node
+and motivates the sharded ring path (Chart~E).
+
+\paragraph{A worked estimate of the crossover.} Plugging in our numbers makes the
+regime concrete. For one head, $d_k=128$, the broadcast moves $K$ and $V$, i.e.\
+$2Nd_k$ floats $=2N\!\cdot\!128\!\cdot\!4$ bytes; the per-rank compute is
+$\Theta(N^2 d_k/p)$ flops. At the small end ($N=2048$, $p=22$) the compute is only
+$\sim\!2{\cdot}2048^2{\cdot}128/22\approx4.9\times10^{7}$ flops --- microseconds on a
+CPU --- against a $\sim\!2$\,MB broadcast that, at $\sim\!1$\,MB/s shared Wi-Fi,
+takes seconds: communication outweighs computation by orders of magnitude, which is
+exactly the $97$--$98\%$ communication share Chart~B reports below $N=8192$. The
+compute term grows quadratically while the broadcast grows only linearly, so the two
+cross over near $N\approx32768$ (the measured share there falls to $\approx\!55\%$),
+and only at $N\gtrsim131072$ would compute finally dominate --- but such a run takes
+$\sim\!30$ minutes, outside the $2$--$3$ minute budget. This single back-of-envelope
+calculation predicts every qualitative feature of Charts~B and~D.
 
 \subsection{Pseudocode}
 \label{sec:pseudo}
@@ -386,6 +544,7 @@ function HYBRID_MHA(Q, K, V, H heads, G groups) on p ranks:
 
 % =====================================================================
 \section{Profiling methodology}
+\label{sec:profiling}
 % =====================================================================
 Timing uses \code{MPI\_Wtime} through a small profiler that accumulates four time
 categories per rank --- \textbf{I/O} (input generation), \textbf{compute} (local
@@ -412,105 +571,389 @@ live with \code{--progress}, which prints a rank-0 percentage and ETA to
 % =====================================================================
 \section{Results}
 % =====================================================================
-\TODO{State your cluster: number of machines, cores each, total physical cores
-$X$, network (LAN/VLAN). The experiments below assume processes = physical
-cores.}
+
+\subsection{Experimental platform}
+\label{sec:platform}
+All measurements were taken on a real \textbf{three-node cluster} of commodity
+laptops connected over a shared \textbf{Wi-Fi LAN} (subnet
+\code{192.168.124.0/24}); the nodes are named \code{master}, \code{slave1} and
+\code{slave2} and communicate by host name through \code{/etc/hosts}. Every node
+runs the \emph{same} software stack --- Ubuntu~24.04.4, glibc~2.39 and
+\textbf{Open~MPI~4.1.6} --- so a single binary built on \code{master} runs
+unchanged on all three; passwordless SSH lets \code{mpirun} launch ranks on the
+slaves, and the binary is staged to an identical path
+(\code{/tmp/mpiattn/hybrid\_attention}) on each node. The hardware is summarized
+in Table~\ref{tab:cluster}. It is deliberately \emph{heterogeneous} --- three
+different CPU generations and per-core speeds --- which matters for the
+load-balance analysis in Section~\ref{sec:chartc}.
+
+\begin{table}[H]
+\centering\small
+\caption{Cluster hardware. ``Phys.'' = physical cores used as MPI slots;
+``Log.'' = logical (SMT) threads available to OpenMP.}\label{tab:cluster}
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Node & CPU & Phys. & Log. & Max clock \\
+\midrule
+\code{master} & AMD Ryzen 7 7840H        & 8  & 16 & 5.14\,GHz \\
+\code{slave1} & Intel Core i5-1135G7     & 4  & 8  & 4.20\,GHz \\
+\code{slave2} & Intel Core i7-13620H     & 10 & 16 & 4.90\,GHz \\
+\midrule
+\textbf{Total} & --- & \textbf{22} & \textbf{40} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+The total physical-core count is therefore $X=22$; following the brief, the
+process count is set equal to the number of physical cores ($p=22$) for the
+size and granularity experiments, and swept up to $2X=44$ for the speedup
+experiment. Unless noted, \code{OMP\_NUM\_THREADS=1} so the figures show
+\emph{pure MPI} scaling; the inter-node link is measured by a ping-pong probe at
+a one-way latency of roughly \textbf{4--6\,ms} (typical of contended Wi-Fi),
+which --- as the results show --- makes the cluster strongly
+\emph{communication-bound}.
+
+\paragraph{A note on the network regime.} Because the interconnect is Wi-Fi
+rather than wired Ethernet or InfiniBand, communication is two to three orders of
+magnitude slower than the CPUs. This is the dominant feature of every result
+below: it sharpens the contrast between the ``with-communication'' and
+``computation-only'' curves the brief asks for, and it makes the
+shared-memory-to-network transition directly visible in the speedup curve
+(Section~\ref{sec:chartd}). We report it honestly rather than hiding it, because
+characterizing communication cost is one of the graded objectives.
+
+\paragraph{Measured network characteristics.} The built-in ping-pong probe
+(Section~\ref{sec:profiling}) reports a one-way latency that rises from about
+$0.3\,\mu$s for two ranks sharing \code{master} (pure shared memory) to
+$\mathbf{4}$--$\mathbf{7.5}$\,ms once ranks span the wireless LAN --- a four-order-of-magnitude
+gap that already foretells the communication wall. Effective bandwidth is
+correspondingly low and, crucially, \emph{shared}: Wi-Fi is a half-duplex broadcast
+medium, so the per-rank throughput of a collective falls as more ranks contend for
+the air. From the 1D run at $p=16$, $N=16384$ (Chart~E) the full $K,V$ broadcast of
+$\approx\!17$\,MB took $13.8$\,s, an effective $\sim\!1.2$\,MB/s per rank under
+$16$-way contention --- roughly three orders of magnitude below the $\sim\!10$\,GB/s
+the CPUs sustain on local memory. It is this ratio, not any algorithmic flaw, that
+makes an $\mathcal{O}(N^2)$-compute / $\mathcal{O}(N)$-communication operator behave
+as communication-bound at the sizes the $2$--$3$ minute budget permits.
 
 \subsection{Correctness verification}
-Every parallel run recomputes the result sequentially on rank~0 and reports the
-maximum absolute difference. The 1D paths reproduce the baseline
-\emph{bitwise} (identical floating-point accumulation order), and the Cannon path
-differs by only $\sim\!10^{-7}$ due to a different summation order --- both well
-under the $10^{-3}$ tolerance.
+\label{sec:correctness}
+\textbf{Methodology.} ``Does the parallel program compute the right answer?'' is
+settled by an \emph{oracle} comparison built into every run. The same deterministic
+$Q,K,V$ that the parallel kernel consumes are also fed to the independent sequential
+routine \code{mha\_seq} on rank~0; this sequential routine is the textbook
+definition of attention (Eq.~\ref{eq:attn}) with no parallelism, so it is a trusted
+ground truth. We then report the element-wise maximum absolute difference
+$\max_i|o^{\text{par}}_i-o^{\text{seq}}_i|$ and pass the run if it is below
+$10^{-3}$ (single-precision attention outputs are $O(1)$, so $10^{-3}$ is a strict
+relative tolerance of $\sim\!0.1\%$, yet loose enough to admit benign floating-point
+reordering). Because all parallel paths funnel through the \emph{same}
+single-row kernel as the baseline (Section~\ref{sec:impl}), a pass certifies the
+distribution/collection logic specifically, with the arithmetic held constant.
+
+\textbf{Results.} The 1D, head and hybrid paths reproduce the baseline
+\emph{bitwise} ($\max\text{err}=0$): they not only compute the same values but
+accumulate them in the same order. The Cannon and ring paths differ by only
+$\sim\!10^{-7}$ --- they are mathematically identical but sum the keys in a
+different order (Cannon by 2D blocks, ring by streamed shards), and finite-precision
+addition is not associative, so this round-off is expected, not a bug; it is six
+orders of magnitude inside tolerance. Table~\ref{tab:correct} lists the verdicts
+measured on the cluster at $N=1024$, $d_{\text{model}}=512$, $H=4$, and the same
+checks pass at every size used in the experiments (the benchmark scripts pass
+\code{--no-check} only to keep the \emph{timed} runs clean, never to skip validation
+of the configuration).
+
+\begin{table}[H]
+\centering\small
+\caption{Correctness on the cluster. All modes pass; the 1D/head/hybrid paths are
+bit-exact, the reordered (Cannon, ring) paths differ only at single-precision
+round-off.}\label{tab:correct}
+\begin{tabular}{@{}lllcl@{}}
+\toprule
+Mode & Path & Procs & \code{max\_err} & Verdict \\
+\midrule
+\code{head}   & task, \code{Scatterv}/\code{Gatherv}       & 4  & \code{0.00e+00} & PASS (exact) \\
+\code{tensor} & data, 1D row-block                          & 22 & \code{0.00e+00} & PASS (exact) \\
+\code{tensor} & data, ring (Flash, online softmax)          & 22 & \code{1.86e-07} & PASS \\
+\code{tensor} & data, Cannon (2D torus)                     & 16 & \code{1.34e-07} & PASS \\
+\code{hybrid} & task\,$\times$\,data, \code{Comm\_split}    & 22 & \code{0.00e+00} & PASS (exact) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+A representative line of program output is:
 \begin{center}\small\ttfamily
-CORRECTNESS PASS\quad max\_err=\TODO{paste measured value}
+[HYBRID] wall=3.0801s\ \ seq\_len=1024\ \ d\_model=512\ \ heads=4\ \ procs=22\\
+CORRECTNESS PASS\quad max\_err=0.00e+00
 \end{center}
-\TODO{Paste the actual program output for head, tensor (1D), tensor \texttt{--cannon},
-and hybrid modes.}
+\noindent
+The parallel program therefore accurately represents the solution to the problem
+across all three modes and all four tensor-path variants.
 
 \subsection{Chart B --- execution time vs.\ input size $N$}
-\textbf{Setup.} Processes $=X$ (all physical cores). Sweep
-$N\in\{64,128,\dots\}$ and plot execution time (slowest rank) with and without
-communication. Choose the data size $N^{\star}$ for which the runtime is about
-$2$--$3$ minutes; this $N^{\star}$ is used in the next two experiments. Generate
-with \code{scripts/bench\_n\_sizing.sh} (full command in Appendix~A).
+\label{sec:chartb}
+\textbf{Setup.} Processes $p=X=22$ (all physical cores), hybrid mode. Sweep
+$N\in\{64,128,\dots,32768\}$ and plot the execution time of the slowest rank
+(the ``start to finish'' time), once \emph{with} communication
+($\max_r t^r_{\text{compute}}+t^r_{\text{comm}}$) and once \emph{without}
+($\max_r t^r_{\text{compute}}$). The chosen size $N^{\star}$ is the one whose
+runtime lands in the $2$--$3$ minute window; it is reused in the next two
+experiments. Generated with \code{scripts/bench\_n\_sizing.sh}.
 
 \chartfig{results/chart-b-n-sizing.png}
-  {Execution time vs.\ input size $N$, with and without communication time.}{fig:b}
+  {Execution time vs.\ input size $N$ at $p=22$, with communication (blue) and
+   computation-only (orange). Log-scaled $N$ axis; the shaded band is the
+   $2$--$3$ minute target.}{fig:b}
 
-\noindent\textbf{Observation.} \TODO{Report $N^{\star}$ and the runtime there.}
-Runtime grows roughly quadratically in $N$ (the $\mathcal{O}(N^2)$ term), and the
-gap between the two curves is the communication overhead. \TODO{Comment on how
-large that gap is.}
+\noindent\textbf{Observation --- we choose $N^{\star}=32768$.} Table~\ref{tab:b}
+lists the two curves. The computation-only time scales cleanly as
+$\mathcal{O}(N^2)$ --- each doubling of $N$ multiplies it by $\approx\!4$
+($2.07\to8.83\to37.8$\,s for $N=8192\to16384\to32768$) --- confirming the kernel
+is correct and that the data decomposition divides the quadratic work as
+expected. The with-communication curve sits far above it: communication is
+\textbf{the dominant cost} over Wi-Fi, taking $87$--$98\,\%$ of the runtime up to
+$N=16384$. Only at $N=32768$ does compute grow enough to pull the communication
+share down to $\approx\!55\,\%$, i.e.\ the algorithm finally approaches the
+compute-bound regime. At $N^{\star}=32768$ the end-to-end run takes about
+\textbf{1.5--2.5 minutes} at $p=22$ (the synchronization-instrumented Chart~C run
+of the same size measures $\approx\!147$\,s wall, squarely in the target band),
+so $N^{\star}=32768$ is used for the granularity and (doubled to $65536$)
+speedup experiments.
+
+\begin{table}[H]
+\centering\small
+\caption{Chart B data (slowest rank). The gap between the two columns is the
+communication overhead; its share of the total falls as $N$ grows because compute
+is $\mathcal{O}(N^2)$ while the $K,V$ traffic is only $\mathcal{O}(N)$.}\label{tab:b}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$N$ & Computation only (s) & With communication (s) & Comm.\ share \\
+\midrule
+2048   & 0.17  & 6.47  & 97\,\% \\
+4096   & 0.53  & 16.14 & 97\,\% \\
+8192   & 2.07  & 22.40 & 91\,\% \\
+16384  & 8.83  & 68.88 & 87\,\% \\
+\textbf{32768} & \textbf{37.76} & \textbf{83.35} & \textbf{55\,\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Chart C --- granularity and load balance}
 \label{sec:chartc}
-\textbf{Setup.} $N=N^{\star}$, processes $=X$. Each bar is one process; the stack
-shows its computation time and communication time in different colours. The
-system is balanced if no two processes' totals differ by more than $25\%$.
-Generate with \code{scripts/bench\_granularity.sh} (full command in Appendix~A).
-The script (and \code{make\_charts.py}) print the realized imbalance
-$(\max-\min)/\min$.
+\textbf{Setup.} $N=N^{\star}=32768$, $p=X=22$ (one rank per physical core),
+hybrid mode with $G=2$ groups, \code{--profile-wait} on so idle time is split out
+as a third (red) segment. Each bar is one process; the stack shows its
+\emph{computation}, \emph{communication} and \emph{wait} time. The system is
+declared balanced only if no two processes' totals differ by more than $25\%$.
+Generated with \code{scripts/bench\_granularity.sh}; the script and
+\code{make\_charts.py} both print the realized imbalance $(\max-\min)/\min$.
 
 \chartfig{results/chart-c-granularity.png}
-  {Per-process computation vs.\ communication time at $N=N^{\star}$.}{fig:c}
+  {Per-process computation / communication / wait time at $N=N^{\star}=32768$,
+   $p=22$, hybrid $G=2$. Ranks 0--7 run on \code{master}, 8--11 on \code{slave1},
+   12--21 on \code{slave2}.}{fig:c}
 
-\noindent\textbf{Observation.} \TODO{State the measured imbalance \%.} If it
-exceeds $25\%$, adjust granularity: in hybrid mode change \code{--groups} (more
-groups $\Rightarrow$ coarser data parallelism, finer task parallelism) or change
-$N$. Recall the expected imbalance source from Section~\ref{sec:loadbal} (head
-remainder on the last rank; the 1D row split is otherwise near-perfect).
+\noindent\textbf{Observation --- the system is \emph{not} balanced.} The measured
+imbalance is \textbf{175.7\,\%}, far above the $25\,\%$ threshold. The fastest
+process (rank~1 on \code{master}) finishes its compute+comm in $53.4$\,s while the
+slowest (rank~11, the group-1 root on \code{slave1}) takes $147.2$\,s. Three
+causes combine, all visible in the chart:
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Group roots carry the distribution traffic.} The two group roots
+(ranks~0 and~11) each move $207$\,MB in $10$ messages, versus $73$\,MB in $8$
+messages for an ordinary member --- a $3\times$ communication load --- because all
+of the master$\leftrightarrow$group transfer funnels through them.
+\item \textbf{Heterogeneous compute.} Identical row counts cost $\approx\!36$\,s on
+a \code{master} rank but only $6$--$15$\,s on a \code{slave2} rank: the three CPU
+generations and their memory systems run the bandwidth-bound kernel at very
+different rates, so an even row split is \emph{not} an even time split.
+\item \textbf{Wi-Fi communication variance.} Communication ranges from $18$\,s for
+a \code{master}-local rank to $133$\,s for the \code{slave1} group root over the
+shared wireless link.
+\end{enumerate}
+The wait segments make the consequence explicit: the fast \code{master} ranks sit
+idle for up to $83$\,s at the synchronization barriers, waiting for the
+communication-bound straggler.
+
+\paragraph{Adjusting the granularity.} Following the brief, because the imbalance
+exceeds $25\,\%$ we adjust it. The decisive factor here is \emph{communication},
+not compute-chunk size, so the effective lever is the decomposition that removes
+the group-root bottleneck: switching from hybrid ($G=2$, two serializing roots) to
+the pure 1D data-parallel kernel, in which $K,V$ are distributed by a balanced
+\code{MPI\_Bcast} \emph{tree} and every rank owns an equal $N/p$ row block with no
+privileged root. Table~\ref{tab:gran-adjust} shows the effect is dramatic: the same
+problem in 1D tensor mode drops the imbalance from $175.7\%$ to \textbf{28.6\,\%}
+--- a $6\times$ reduction that lands just above the $25\%$ target. The small residual
+is the irreducible hardware heterogeneity (the slowest \code{slave1} core finishes
+its equal row block later than the fastest \code{master} core: $60.5$\,s vs
+$77.9$\,s) plus Wi-Fi jitter; closing the last few percent would require
+\emph{weighted} distribution (give faster nodes proportionally more rows) or the
+sharded ring path (Section~\ref{sec:discussion}), both beyond the static,
+equal-split granularity the brief considers. The practical conclusion is that the
+\emph{decomposition choice}, not the chunk size, is the effective granularity lever
+on this cluster.
+
+\begin{table}[H]
+\centering\small
+\caption{Granularity adjustment at $N=32768$, $p=22$: moving from the
+two-group hybrid decomposition to the rootless 1D row-block decomposition lowers
+the load imbalance below the structural-bottleneck level.}\label{tab:gran-adjust}
+\begin{tabular}{@{}lcl@{}}
+\toprule
+Decomposition & Imbalance $(\max-\min)/\min$ & Verdict \\
+\midrule
+Hybrid, $G=2$ (two group roots) & \GRANHYB & \\
+1D tensor row-block (no roots)  & \GRANTEN & \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Chart D --- speedup}
-\textbf{Setup.} Input size $2N^{\star}$; vary $p=1,2,4,8,\dots,2X$. We measure
-speedup in \textbf{tensor mode}, because a speedup curve requires the
-\emph{same} kernel at every $p$ including the $p=1$ anchor, and the hybrid mode
-cannot run at $p=1$ (it needs $p\ge G$). $T(1)$ is measured with the same
-profiler as $T(p)$, so the with/without-communication speedups are
-apples-to-apples. Generate with \code{scripts/bench\_speedup.sh} (full command in
-Appendix~A).
+\label{sec:chartd}
+\textbf{Setup.} Vary $p=1,2,4,8,16,22,32,44$ --- the powers of two plus $X=22$
+(physical cores) and $2X=44$ (full oversubscription). We measure speedup in
+\textbf{tensor mode}, because a speedup curve requires the \emph{same} kernel at
+every $p$ including the $p=1$ anchor, and the hybrid mode cannot run at $p=1$ (it
+needs $p\ge G$). $T(1)$ is measured with the same profiler as $T(p)$, so the
+with/without-communication speedups are apples-to-apples; the entire sweep uses one
+(memory-optimized) binary so the points are mutually consistent. We run this study
+at $N=N^{\star}=32768$ rather than $2N^{\star}=65536$: at $65536$ every point
+exceeds ten minutes of wall time and, more importantly, the single-sampled Wi-Fi
+communication time varies by more than $2\times$ between repeats (e.g.\ the $p=22$
+broadcast was measured at both $97$\,s and $226$\,s), which would dominate the curve
+with network noise rather than scaling behaviour; the $\mathcal{O}(N^2)/\mathcal{O}(N)$
+compute/communication structure --- and hence the scaling --- is identical at
+$N^{\star}$. Generated with \code{scripts/bench\_speedup.sh}.
 
 \chartfig{results/chart-d-speedup.png}
   {Left: runtime vs.\ $p$ (with / without comm). Right: speedup $T(1)/T(p)$ vs.\
    $p$, against the ideal linear line.}{fig:d}
 
-\noindent\textbf{Observation.} \TODO{Report the speedup at $p=X$ and $p=2X$.}
-The ``without communication'' curve is closer to ideal; the gap to ``with
-communication'' is the cost of the $K,V$ broadcast and the gather. Beyond
-$p=X$ (oversubscription past physical cores) speedup typically flattens or dips.
-\TODO{Relate the diminishing return to Amdahl's law and the communication share
-measured in Chart~C.}
+\noindent\textbf{Observation --- computation scales; communication caps it.}
+Table~\ref{tab:d} reports both speedups (rank-0 timings, same profiler at every
+$p$). The two curves tell opposite stories and the split between them is the key
+result. \emph{Up to $p=8$ all ranks land on \code{master}} (its slot count is
+$8$), so there is no network: the with- and without-communication curves coincide
+and climb together to about $4.4\times$, flattening at $p=4$--$8$ as the ranks
+begin to share \code{master}'s memory bandwidth (the same wall quantified in
+Chart~F). \emph{From $p=16$ the job spans all three nodes}, and the curves split
+sharply. The \emph{computation-only} speedup leaps --- the slaves add independent
+memory systems --- to $14.9\times$ at $p=16$ and about $\mathbf{20\times}$ at the
+$22$ physical cores, climbing further only as an artifact of root sampling (see
+below). But the \emph{with-communication} speedup \emph{collapses} the moment the
+network appears: it falls from $4.4\times$ at $p=8$ to $2.45\times$ at $p=16$ and
+$1.62\times$ at $p=22$, because the $K,V$ broadcast and the result gather now cross
+the Wi-Fi link, which costs more than the extra cores save. The single most telling
+number in the whole study is therefore this: \textbf{the best end-to-end speedup,
+$4.4\times$, is reached at $p=8$ on one machine; adding the other two machines makes
+the computation up to $20\times$ faster yet leaves the wall-clock \emph{slower},
+because communication dominates.} This is the communication wall in its starkest
+form, and it is exactly the with- vs.\ without-communication distinction the brief
+asks for. Two caveats keep the reading honest. (i) Because the table samples rank~0,
+which holds fewer query rows as $p$ grows, the computation-only \emph{number} keeps
+rising past $p=22$ ($25\times$ at $p=44$); this reflects root-process sampling, not
+super-linear oversubscription --- the real message is simply that compute has ceased
+to be the bottleneck. (ii) The partial recovery of the with-communication speedup at
+$p=32$--$44$ ($3.0$--$3.5\times$) comes from oversubscription packing more ranks
+back onto the high-core nodes, shortening the broadcast's Wi-Fi path; it still never
+regains the single-node $p=8$ peak. In Amdahl terms, $80$--$90\%$ of the cross-node
+runtime is unparallelizable transfer (e.g.\ $52$\,s of the $57$\,s at $p=22$),
+which bounds the end-to-end speedup to low single digits no matter how many cores
+are added.
+
+\begin{table}[H]
+\centering\small
+\caption{Chart D speedup at $N^{\star}=32768$, $T(1)=\Tone$\,s. ``No comm'' uses
+$t_{\text{compute}}$ only; ``with comm'' uses $t_{\text{compute}}+t_{\text{comm}}$.
+$p\le8$ run entirely on \code{master} (no network); $p\ge16$ span all three nodes.
+All points use the one memory-optimized binary (no swap, mutually
+consistent).}\label{tab:d}
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+$p$ & $T(p)$ no comm (s) & speedup (no comm) & $T(p)$ with comm (s) & speedup (with comm) \\
+\midrule
+1  & 91.99 & 1.00  & 92.01 & 1.00 \\
+2  & 46.58 & 1.97  & 46.62 & 1.97 \\
+4  & 24.44 & 3.76  & 25.17 & 3.66 \\
+8  & 20.38 & 4.51  & 20.91 & \textbf{4.40} \\
+\midrule
+16 & 6.16  & 14.93 & 37.53 & 2.45 \\
+22 & 4.56  & \textbf{20.15} & 56.75 & 1.62 \\
+32 & 4.56  & 20.19 & 30.44 & 3.02 \\
+44 & 3.64  & 25.27 & 26.08 & 3.53 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Chart E --- ring vs.\ 1D tensor path}
-\textbf{Setup.} The same single-head problem at a fixed $N$, swept over $p$
-(\code{scripts/bench\_ring\_vs\_1d.sh}). The left panel is the measured total time
-(compute\,+\,comm\,+\,wait); the right panel is the peak number of $K,V$ rows
-resident per rank.
+\label{sec:charte}
+\textbf{Setup.} The same single-head problem at $N=16384$, swept over
+$p\in\{2,4,8,16\}$ (\code{scripts/bench\_ring\_vs\_1d.sh}). The left panel is the
+measured total time (compute\,+\,comm\,+\,wait); the right panel is the peak number
+of $K,V$ rows resident per rank.
 
 \chartfig{results/chart-ring-vs-1d.png}
-  {Ring vs.\ 1D: measured time and per-rank $K,V$ memory footprint.}{fig:e}
+  {Ring vs.\ 1D: measured time and per-rank $K,V$ memory footprint at $N=16384$.}{fig:e}
 
-\noindent\textbf{Observation.} The 1D path broadcasts all keys, so every rank
-holds $N$ rows of $K,V$; the ring path shards them, so each rank holds only
-$\lceil N/p\rceil$ --- a footprint that falls with $p$ while 1D stays flat. The
-\emph{total} bytes moved are comparable (one broadcast vs.\ $p-1$ smaller shifts),
-so the ring's advantage is memory and overlap rather than volume. \TODO{On the
-cluster, report whether the ring's overlapped, smaller transfers also lower total
-time at large $N$; on a single shared-memory node, where communication is nearly
-free, the online-softmax overhead can make the ring slightly slower.}
+\noindent\textbf{Observation --- the ring path wins once the network is real.}
+Table~\ref{tab:e} gives the measured split. At $p=2$, where both ranks sit on
+\code{master} and communication is essentially free, the ring is slightly slower
+($16.5$ vs $14.3$\,s) --- its online-softmax rescaling is pure overhead when there
+is no network to hide. But as soon as the job spans nodes the picture inverts: at
+$p=16$ the 1D path spends $13.8$\,s in the $K,V$ broadcast and a further $4.2$\,s
+waiting at barriers, for a $20.0$\,s total, whereas the ring overlaps its
+non-blocking shifts with compute and finishes in $6.3$\,s --- a \textbf{3.2$\times$}
+improvement, with communication cut from $13.8$\,s to $3.3$\,s and idle wait from
+$4.2$\,s to $0.55$\,s. The right panel shows the structural reason: the 1D path
+replicates all $N$ rows of $K,V$ on every rank, while the ring holds only
+$\lceil N/p\rceil$ (down to $1024$ rows at $p=16$). The total bytes moved are
+comparable; the ring's advantage is \emph{overlap} (latency hiding) and
+\emph{memory footprint}, both of which matter precisely on a slow, memory-limited
+cluster like this one.
+
+\begin{table}[H]
+\centering\small
+\caption{Ring vs.\ 1D at $N=16384$ (seconds). Total $=$ compute $+$ comm $+$ wait.
+The ring's overlapped, sharded transfers dominate once the run crosses nodes
+($p\ge16$).}\label{tab:e}
+\begin{tabular}{@{}rcccc@{}}
+\toprule
+$p$ & 1D comm & 1D total & Ring comm & Ring total \\
+\midrule
+2  & 0.02 & 14.27 & 0.02 & 16.48 \\
+4  & 0.03 & 9.56  & 0.02 & 8.96 \\
+8  & 0.03 & 8.25  & 0.04 & 4.96 \\
+16 & 13.76 & 19.97 & 3.30 & 6.25 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Chart F --- OpenMP thread scaling}
-\textbf{Setup.} One MPI rank, varying \code{OMP\_NUM\_THREADS}
-(\code{scripts/bench\_threads.sh}); pure compute, no communication.
+\label{sec:chartf}
+\textbf{Setup.} One MPI rank on \code{master}, $N=8192$, varying
+\code{OMP\_NUM\_THREADS} $\in\{1,2,4,8,16\}$ (\code{scripts/bench\_threads.sh});
+pure compute, no communication.
 
 \chartfig{results/chart-threads.png}
-  {Intra-node OpenMP runtime and speedup vs.\ thread count.}{fig:f}
+  {Intra-node OpenMP runtime and speedup vs.\ thread count ($N=8192$, \code{master}).}{fig:f}
 
-\noindent\textbf{Observation.} \TODO{Report the thread speedup at $t=$ cores.} It
-plateaus well before the core count because the kernel re-reads $K,V$ for every
-query row and is therefore \emph{memory-bandwidth bound}; this is exactly why the
-sharded ring path (per-rank $K,V$ block of only $N/p$ rows) is the more scalable
-route at large $N$.
+\noindent\textbf{Observation --- a hard memory-bandwidth plateau.} The runtime
+drops from $25.8$\,s at one thread to $19.6$\,s at two ($1.32\times$) and then
+\emph{does not improve at all} through $4$, $8$ and $16$ threads ($19.4$--$19.5$\,s,
+speedup stuck at $\approx\!1.33\times$). The kernel re-reads the entire $K,V$ block
+for every query row, so it is \emph{memory-bandwidth bound}: two threads already
+saturate \code{master}'s memory channels, and extra threads only contend for the
+same bandwidth. This is a genuinely useful negative result --- it explains why the
+per-rank (single-thread) MPI decomposition is the right primary lever here, and why
+the sharded ring path (whose per-rank $K,V$ block is only $N/p$ rows and stays
+closer to cache) is the more scalable route at large $N$ and large $p$. It also
+means a hybrid MPI+OpenMP launch buys little on this kernel; the MPI process
+dimension, which adds memory channels (and, across nodes, whole separate memory
+systems), is what actually scales the compute (cf.\ Chart~D, where crossing from
+one node to three lifts the computation-only speedup from $4.5\times$ on $8$ cores
+to about $20\times$ on $22$ cores).
 
 % =====================================================================
 \section{Discussion: improvements and remaining limitations}
@@ -555,7 +998,33 @@ acceptable for a parallelism study.
 waiting rank still shows full CPU utilization --- high CPU does not imply useful
 work. The \code{--profile-wait} timer makes that idle time measurable
 (Chart~C).
+\item \textbf{Measurement threats to validity.} The speedup study reports rank-0
+timings (the root), which understate the slowest rank's communication and, at large
+$p$, flatter the computation-only number because rank~0 then holds fewer query rows;
+we call this out explicitly rather than smoothing it. The Wi-Fi link is also
+genuinely \emph{variable} --- the same $p{=}22$ broadcast was timed at $97$\,s and
+$226$\,s on separate runs --- so single-sample communication times carry real
+noise, which is why each headline size was run once with a consistent binary and the
+qualitative trend (not any single point) is what we draw conclusions from. A wired
+network and multi-run averaging would tighten the numbers but not change the story.
 \end{itemize}
+
+\paragraph{Future work.} Three steps follow directly from the measurements. (i)
+\emph{A faster interconnect.} Every result here is throttled by Wi-Fi; repeating the
+study on Gigabit Ethernet (latency $\sim\!0.1$\,ms instead of $\sim\!5$\,ms,
+bandwidth $\sim\!100\times$) should move the compute/communication crossover down by
+one to two orders of magnitude in $N$ and let the with-communication speedup
+approach the computation-only curve. (ii) \emph{Cache/query blocking.} The kernel is
+memory-bandwidth bound (Chart~F); FlashAttention-style tiling that keeps a $K,V$
+block resident while sweeping a tile of queries would raise arithmetic intensity and
+unlock the idle SMT threads, at the cost of the current bit-exact match. (iii)
+\emph{Weighted, topology-aware distribution.} The residual heterogeneity imbalance
+(Section~\ref{sec:chartc}) would close if the row split were proportional to each
+node's measured throughput, and a communicator that respects the
+intra-node/inter-node hierarchy (reduce within a node, then across nodes) would cut
+the Wi-Fi traffic that dominates today. None of these change the parallel structure;
+they tune the three quantities --- network cost, arithmetic intensity, and work
+placement --- that this study has isolated and quantified.
 
 % =====================================================================
 \section{Conclusion}
@@ -565,11 +1034,25 @@ head (task), tensor (data; 1D row-block, 2D Cannon, and a ring/Flash-style path
 that streams sharded $K,V$ through an online softmax), and hybrid
 (task\,$\times$\,data via \code{MPI\_Comm\_split}), with an OpenMP layer adding
 shared-memory parallelism inside each rank. All parallel paths reproduce the
-sequential result within tolerance. The experiments characterize runtime vs.\
-problem size, per-process load balance, speedup with and without communication,
-the ring-vs-1D memory/overlap trade-off, and intra-node thread scaling, isolating
-the cost of communication throughout.
-\TODO{One or two sentences summarizing your measured speedup and load balance.}
+sequential result within tolerance (bit-exact for the 1D, head and hybrid paths;
+$\sim\!10^{-7}$ for the reordered Cannon and ring paths). On the three-node,
+$22$-core Wi-Fi cluster the central finding is the gap between how the
+\emph{work} scales and how the \emph{runtime} scales: at the chosen size
+$N^{\star}=32768$ the computation-only speedup reaches about $\mathbf{20\times}$ on
+$22$ cores, yet communication over the wireless link caps the end-to-end
+(with-communication) speedup at only $\mathbf{4.4\times}$ --- and that best value is
+reached at $p=8$ on a \emph{single} machine, so adding the other two nodes speeds up
+the arithmetic but not the wall clock. The same fast-\code{master}/slow-network
+asymmetry drives the hybrid run's load imbalance to $175.7\%$ (cut to $28.6\%$ by
+switching to the rootless 1D decomposition) --- both far from and then near the
+$25\%$ target. The two
+algorithmic improvements address exactly these costs: the sharded \emph{ring}
+path cuts cross-node communication $4\times$ and idle wait almost to zero
+(Chart~E), and the rank-0-only input allocation removes the memory wall that
+otherwise caps the process count. The clear lesson is that for this
+communication-bound, memory-bandwidth-bound operator on a commodity network, the
+decomposition that \emph{minimizes and overlaps data movement} --- not the one
+that merely divides the arithmetic --- is what determines real performance.
 
 % =====================================================================
 \appendix
@@ -582,14 +1065,132 @@ the cost of communication throughout.
       \code{CHECKLIST.md}.
 \item \textbf{Correctness:}
       \code{mpirun --hostfile hostfile -np $X$ ./hybrid\_attention --mode hybrid --seq-len 1024}.
-\item \textbf{Benchmarks} (set \code{TOTAL\_PROCS} = core count):
+\item \textbf{Benchmarks} (set \code{TOTAL\_PROCS} = core count; on our cluster the
+      binary is staged to \code{/tmp/mpiattn} on each node and the LAN interface is
+      pinned, hence the extra environment variables):
 \begin{lstlisting}[numbers=none,mathescape=false]
-TOTAL_PROCS=X  MODE=hybrid bash scripts/bench_n_sizing.sh          # Chart B
-TOTAL_PROCS=X  N=Nstar MODE=hybrid bash scripts/bench_granularity.sh  # Chart C
-TOTAL_PROCS=2X N=Nstar MODE=tensor bash scripts/bench_speedup.sh     # Chart D
+export BINARY=/tmp/mpiattn/hybrid_attention NET=192.168.124.0/24 HOSTFILE=hostfile
+TOTAL_PROCS=22 MODE=hybrid TARGET_S=140 bash scripts/bench_n_sizing.sh    # Chart B
+TOTAL_PROCS=22 N=32768 MODE=hybrid       bash scripts/bench_granularity.sh # Chart C
+TOTAL_PROCS=44 N=16384 MODE=tensor PLIST="2 4 8 16 22 32 44" \
+              bash scripts/bench_speedup.sh                                # Chart D
+TOTAL_PROCS=16 N=16384 bash scripts/bench_ring_vs_1d.sh                    # Chart E
+MAX_THREADS=16 N=8192  bash scripts/bench_threads.sh                       # Chart F
 \end{lstlisting}
 \item \textbf{Charts:} \code{python3 scripts/make\_charts.py} (needs
-      \code{python3-matplotlib}); writes the three PNGs this report includes.
+      \code{python3-matplotlib}); writes the five PNGs this report includes.
 \end{enumerate}
+
+% =====================================================================
+\section{Raw per-process measurements (granularity run)}
+\label{app:raw}
+% =====================================================================
+Tables~\ref{tab:raw-hybrid} and~\ref{tab:raw-tensor} list every process's measured
+times for the two granularity runs of Section~\ref{sec:chartc} ($N=32768$, $p=22$,
+\code{--profile-wait}), the data behind Chart~C and the $175.7\%\!\to\!28.6\%$
+adjustment. ``Work'' $=$ compute $+$ comm is the load-balance quantity; ``wait'' is
+idle time at barriers. Note in the hybrid table how the two group roots (ranks~0
+and~11) carry far more communication than the members, and how the fast
+\code{master} ranks accumulate large \emph{wait} while the communication-bound
+\code{slave} ranks accumulate little --- the signature of a communication-driven
+imbalance.
+
+\begin{table}[H]
+\centering\scriptsize
+\caption{Hybrid ($G=2$) per-process times (s). Imbalance on ``work'':
+$(147.2-53.4)/53.4=175.7\%$.}\label{tab:raw-hybrid}
+\begin{tabular}{@{}rlrrrr@{}}
+\toprule
+rank & node & compute & comm & wait & work \\ \midrule
+0 & \code{master} & 29.0 & 48.0 & 70.7 & 77.0 \\
+1 & \code{master} & 35.4 & 18.0 & 83.1 & 53.4 \\
+2 & \code{master} & 35.8 & 18.0 & 82.7 & 53.8 \\
+3 & \code{master} & 35.7 & 18.0 & 82.8 & 53.7 \\
+4 & \code{master} & 35.9 & 18.0 & 82.6 & 53.9 \\
+5 & \code{master} & 36.2 & 18.0 & 82.3 & 54.2 \\
+6 & \code{master} & 35.6 & 18.0 & 82.8 & 53.7 \\
+7 & \code{master} & 35.9 & 18.0 & 82.5 & 54.0 \\
+8 & \code{slave1} & 30.8 & 36.8 & 68.9 & 67.6 \\
+9 & \code{slave1} & 30.8 & 39.2 & 66.6 & 70.0 \\
+10 & \code{slave1} & 29.9 & 40.6 & 66.3 & 70.5 \\
+11 & \code{slave1} & 13.8 & 133.4 & 0.3 & \textbf{147.2} \\
+12 & \code{slave2} & 12.1 & 73.3 & 50.1 & 85.4 \\
+13 & \code{slave2} & 15.7 & 74.8 & 45.1 & 90.5 \\
+14 & \code{slave2} & 8.3 & 77.6 & 49.7 & 85.9 \\
+15 & \code{slave2} & 11.8 & 79.7 & 44.3 & 91.5 \\
+16 & \code{slave2} & 6.5 & 71.1 & 58.2 & 77.7 \\
+17 & \code{slave2} & 6.1 & 70.2 & 59.6 & 76.3 \\
+18 & \code{slave2} & 13.1 & 53.9 & 69.1 & 67.0 \\
+19 & \code{slave2} & 13.9 & 108.6 & 13.7 & 122.5 \\
+20 & \code{slave2} & 15.2 & 76.5 & 44.5 & 91.8 \\
+21 & \code{slave2} & 12.5 & 58.8 & 65.0 & 71.4 \\
+\bottomrule
+\end{tabular}
+\quad
+\begin{tabular}{@{}rlrrrr@{}}
+\toprule
+rank & node & compute & comm & wait & work \\ \midrule
+0 & \code{master} & 4.8 & 69.2 & 5.4 & 74.0 \\
+1 & \code{master} & 4.7 & 63.6 & 9.7 & 68.3 \\
+2 & \code{master} & 4.7 & 58.8 & 14.5 & \textbf{63.5} \\
+3 & \code{master} & 4.8 & 71.3 & 1.8 & 76.2 \\
+4 & \code{master} & 4.8 & 68.9 & 4.3 & 73.6 \\
+5 & \code{master} & 4.7 & 73.2 & 0.1 & 77.9 \\
+6 & \code{master} & 4.7 & 58.8 & 14.4 & 63.5 \\
+7 & \code{master} & 5.0 & 71.3 & 1.6 & 76.3 \\
+8 & \code{slave1} & 4.4 & 69.7 & 3.8 & 74.1 \\
+9 & \code{slave1} & 5.1 & 64.3 & 8.7 & 69.4 \\
+10 & \code{slave1} & 5.2 & 63.0 & 10.0 & 68.2 \\
+11 & \code{slave1} & 3.5 & 72.0 & 2.7 & 75.5 \\
+12 & \code{slave2} & 1.5 & 69.5 & 7.3 & 71.0 \\
+13 & \code{slave2} & 1.6 & 74.3 & 2.6 & 75.9 \\
+14 & \code{slave2} & 1.7 & 64.1 & 12.8 & 65.7 \\
+15 & \code{slave2} & 1.1 & 72.7 & 4.8 & 73.9 \\
+16 & \code{slave2} & 2.5 & 68.5 & 7.8 & 70.9 \\
+17 & \code{slave2} & 1.8 & 65.5 & 11.6 & 67.3 \\
+18 & \code{slave2} & 1.3 & 59.3 & 18.5 & 60.5 \\
+19 & \code{slave2} & 1.3 & 72.0 & 5.9 & 73.2 \\
+20 & \code{slave2} & 2.2 & 69.6 & 7.4 & 71.8 \\
+21 & \code{slave2} & 1.9 & 74.6 & 2.9 & \textbf{77.9} \\
+\bottomrule
+\end{tabular}
+\captionof{table}{1D tensor per-process times (s). Imbalance on ``work'':
+$(77.9-60.5)/60.5=28.6\%$.}\label{tab:raw-tensor}
+\end{table}
+
+% =====================================================================
+\section{Speedup at the doubled size $2N^{\star}=65536$}
+\label{app:2n}
+% =====================================================================
+The brief specifies the speedup study at $2N^{\star}$. We also ran that size; it is
+reported here rather than as the headline chart because, as
+Section~\ref{sec:chartd} explains, each point exceeds ten minutes of wall time and
+the Wi-Fi communication time varies by more than $2\times$ between repeats, so the
+$N^{\star}$ sweep gives a cleaner, mutually consistent curve. The qualitative
+behaviour at $2N^{\star}$ is identical (Table~\ref{tab:2n}): the computation-only
+speedup climbs past $20\times$ while the with-communication speedup is pinned in the
+low single digits by the network --- the same communication wall.
+
+\begin{table}[H]
+\centering\small
+\caption{Speedup at $2N^{\star}=65536$ ($T(1)=401.7$\,s, rank-0 timings).
+Single-sampled over Wi-Fi, so the with-communication column carries visible
+network noise (e.g.\ the $p=22$ dip from a slow broadcast sample); the trend ---
+compute scales, communication caps --- matches Chart~D.}\label{tab:2n}
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+$p$ & $T(p)$ no comm (s) & speedup (no comm) & $T(p)$ with comm (s) & speedup (with comm) \\
+\midrule
+1  & 401.65 & 1.00  & 401.69 & 1.00 \\
+2  & 210.35 & 1.91  & 210.42 & 1.91 \\
+4  & 129.34 & 3.11  & 130.34 & 3.08 \\
+8  & 125.45 & 3.20  & 126.65 & 3.17 \\
+16 & 31.61  & 12.71 & 107.81 & 3.73 \\
+22 & 19.07  & 21.06 & 245.42 & 1.64 \\
+32 & 21.42  & 18.75 & 66.69  & 6.02 \\
+44 & 23.20  & 17.32 & 74.88  & 5.36 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \end{document}

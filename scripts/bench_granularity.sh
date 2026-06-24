@@ -14,7 +14,7 @@ export LC_ALL=C
 # Override with OMP_NUM_THREADS=N to profile the hybrid MPI+OpenMP balance.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
-BINARY="./hybrid_attention"
+BINARY="${BINARY:-./hybrid_attention}"
 MODE="${MODE:-hybrid}"
 TOTAL_PROCS="${TOTAL_PROCS:-4}"
 HOSTFILE="${HOSTFILE:-hostfile}"
