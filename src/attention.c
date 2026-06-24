@@ -2,29 +2,49 @@
 #include "progress.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
+
+void attention_row(const float *q, const float *K, const float *V,
+                   int n, int d_k, float *o, float *s) {
+    float scale = 1.0f / sqrtf((float)d_k);
+
+    /* scores s[j] = (q . K[j]) * scale, tracking the row max for stability */
+    float mx = -INFINITY;
+    for (int j = 0; j < n; j++) {
+        const float *krow = &K[(size_t)j * d_k];
+        float dot = 0.0f;
+        for (int k = 0; k < d_k; k++) dot += q[k] * krow[k];
+        s[j] = dot * scale;
+        if (s[j] > mx) mx = s[j];
+    }
+
+    /* softmax over the row (this whole row is local to one caller) */
+    float sum = 0.0f;
+    for (int j = 0; j < n; j++) { s[j] = expf(s[j] - mx); sum += s[j]; }
+    for (int j = 0; j < n; j++) s[j] /= sum;
+
+    /* o = s . V — accumulate row-by-row so V is read sequentially (row-major)
+     * and o[k] sums j in 0..n-1 order, matching the old matmul exactly. */
+    for (int k = 0; k < d_k; k++) o[k] = 0.0f;
+    for (int j = 0; j < n; j++) {
+        float w = s[j];
+        const float *vrow = &V[(size_t)j * d_k];
+        for (int k = 0; k < d_k; k++) o[k] += w * vrow[k];
+    }
+}
 
 void attention_seq(const Tensor *Q, const Tensor *K, const Tensor *V, Tensor *out) {
     int seq_len = Q->rows;
     int d_k     = Q->cols;
-    int d_v     = V->cols;
 
-    /* S = Q * K^T   [seq_len x seq_len] */
-    Tensor Kt = transpose(K);
-    Tensor S  = tensor_alloc(seq_len, seq_len);
-    matmul(&S, Q, &Kt);
-    tensor_free(&Kt);
-
-    /* scale by 1/sqrt(d_k) */
-    tensor_scale(&S, 1.0f / sqrtf((float)d_k));
-
-    /* softmax row-wise */
-    softmax_rows(&S);
-
-    /* out = S * V   [seq_len x d_v] */
-    (void)d_v;
-    matmul(out, &S, V);
-
-    tensor_free(&S);
+    /* Streaming: one query row at a time, O(seq_len) scratch — no seq_len x
+     * seq_len score matrix, so this scales to large N without the quadratic
+     * memory (and integer-index) blow-up of the old materialized path. */
+    float *s = (float *)malloc((size_t)seq_len * sizeof(float));
+    for (int i = 0; i < seq_len; i++)
+        attention_row(&AT(*Q, i, 0), K->data, V->data, seq_len, d_k,
+                      &AT(*out, i, 0), s);
+    free(s);
 }
 
 void mha_seq(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,

@@ -79,6 +79,7 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
      * SCATTER: pack Q/K/V column blocks for each rank into a contiguous
      * buffer on root (single MPI_Scatterv per matrix instead of seq_len calls).
      */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     {
         float *Q_packed = NULL, *K_packed = NULL, *V_packed = NULL;
@@ -106,6 +107,10 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
                      Kl.data, seq_len * my_cols, MPI_FLOAT, 0, comm);
         MPI_Scatterv(V_packed, sendcounts, displs, MPI_FLOAT,
                      Vl.data, seq_len * my_cols, MPI_FLOAT, 0, comm);
+
+        /* Q, K, V scattered: three bulk transfers of this rank's slice. */
+        for (int t = 0; t < 3; t++)
+            profiler_count_msg((long)seq_len * my_cols * sizeof(float));
 
         if (rank == 0) { free(Q_packed); free(K_packed); free(V_packed); }
     }
@@ -141,6 +146,7 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
      * GATHER: collect out_local from every rank into a packed buffer on root,
      * then unpack each rank's block back into the right columns of out_full.
      */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     {
         float *out_packed = (rank == 0)
@@ -149,6 +155,7 @@ void head_parallel_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor 
 
         MPI_Gatherv(out_local.data, seq_len * my_cols, MPI_FLOAT,
                     out_packed, sendcounts, displs, MPI_FLOAT, 0, comm);
+        profiler_count_msg((long)seq_len * my_cols * sizeof(float));
 
         if (rank == 0) {
             int col_off = 0, buf_off = 0;

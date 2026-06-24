@@ -1,5 +1,6 @@
 #include "tensor_parallel.h"
 #include "tensor.h"
+#include "attention.h"
 #include "profiler.h"
 #include "progress.h"
 #include <math.h>
@@ -50,9 +51,11 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
     float *Vf = malloc((size_t)seq_len * d_k * sizeof(float));
 
     /* Scatter query rows (non-overlapping -> well defined) */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     MPI_Scatterv(rank == 0 ? Q_full->data : NULL, cnt, dsp, MPI_FLOAT,
                  Qb, my_rows * d_k, MPI_FLOAT, 0, comm);
+    profiler_count_msg((long)my_rows * d_k * sizeof(float));
 
     /* Broadcast full K and V (each process needs all keys/values) */
     if (rank == 0) {
@@ -61,44 +64,20 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
     }
     MPI_Bcast(Kf, seq_len * d_k, MPI_FLOAT, 0, comm);
     MPI_Bcast(Vf, seq_len * d_k, MPI_FLOAT, 0, comm);
+    profiler_count_msg((long)seq_len * d_k * sizeof(float));   /* K */
+    profiler_count_msg((long)seq_len * d_k * sizeof(float));   /* V */
     profiler_stop(TIMER_COMM);
 
-    /* Local attention for each owned query row */
+    /* Local attention for each owned query row. Each row is fully local (the
+     * softmax is per-row and this rank holds full K,V), so we reuse the shared
+     * streaming kernel — identical math to the sequential baseline. */
     profiler_start(TIMER_COMPUTE);
-    float scale = 1.0f / sqrtf((float)d_k);
     float *srow = malloc((size_t)seq_len * sizeof(float));
 
     progress_begin("tensor-attn rows", my_rows);
     for (int i = 0; i < my_rows; i++) {
-        /* scores = Q_i . K_j^T * scale, track row max for stability */
-        float mx = -INFINITY;
-        for (int j = 0; j < seq_len; j++) {
-            float dot = 0.0f;
-            for (int k = 0; k < d_k; k++)
-                dot += Qb[i * d_k + k] * Kf[j * d_k + k];
-            srow[j] = dot * scale;
-            if (srow[j] > mx) mx = srow[j];
-        }
-        /* softmax (local — this row lives entirely on this process) */
-        float sum = 0.0f;
-        for (int j = 0; j < seq_len; j++) {
-            srow[j] = expf(srow[j] - mx);
-            sum += srow[j];
-        }
-        for (int j = 0; j < seq_len; j++) srow[j] /= sum;
-
-        /* O_i = softmax_row . V
-         * Accumulate row-by-row over j so V is read sequentially (row-major)
-         * instead of strided down a column. Each Ob[i][k] still sums j in the
-         * same 0..seq_len-1 order, so the result is bitwise identical. */
-        float *orow = &Ob[i * d_k];
-        for (int k = 0; k < d_k; k++) orow[k] = 0.0f;
-        for (int j = 0; j < seq_len; j++) {
-            float w = srow[j];
-            const float *vrow = &Vf[j * d_k];
-            for (int k = 0; k < d_k; k++)
-                orow[k] += w * vrow[k];
-        }
+        attention_row(&Qb[(size_t)i * d_k], Kf, Vf, seq_len, d_k,
+                      &Ob[(size_t)i * d_k], srow);
         progress_update(i + 1);
     }
     progress_end();
@@ -106,9 +85,11 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
     profiler_stop(TIMER_COMPUTE);
 
     /* Gather output rows back to root */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     MPI_Gatherv(Ob, my_rows * d_k, MPI_FLOAT,
                 rank == 0 ? out_full->data : NULL, cnt, dsp, MPI_FLOAT, 0, comm);
+    profiler_count_msg((long)my_rows * d_k * sizeof(float));
     profiler_stop(TIMER_COMM);
 
     free(Qb); free(Ob); free(Kf); free(Vf);
@@ -140,8 +121,10 @@ static void cannon_matmul(float *A, float *B, float *C,
     /* Initial alignment: A left by coords[0], B up by coords[1] */
     MPI_Cart_shift(cart, 1, -coords[0], &src, &dst);
     MPI_Sendrecv_replace(A, br * bk, MPI_FLOAT, dst, 1, src, 1, cart, MPI_STATUS_IGNORE);
+    profiler_count_msg((long)br * bk * sizeof(float));
     MPI_Cart_shift(cart, 0, -coords[1], &src, &dst);
     MPI_Sendrecv_replace(B, bk * bc, MPI_FLOAT, dst, 2, src, 2, cart, MPI_STATUS_IGNORE);
+    profiler_count_msg((long)bk * bc * sizeof(float));
 
     for (int step = 0; step < sqrt_p; step++) {
         for (int i = 0; i < br; i++)
@@ -153,8 +136,10 @@ static void cannon_matmul(float *A, float *B, float *C,
         /* shift A left by 1, B up by 1 */
         MPI_Cart_shift(cart, 1, -1, &src, &dst);
         MPI_Sendrecv_replace(A, br * bk, MPI_FLOAT, dst, 3, src, 3, cart, MPI_STATUS_IGNORE);
+        profiler_count_msg((long)br * bk * sizeof(float));
         MPI_Cart_shift(cart, 0, -1, &src, &dst);
         MPI_Sendrecv_replace(B, bk * bc, MPI_FLOAT, dst, 4, src, 4, cart, MPI_STATUS_IGNORE);
+        profiler_count_msg((long)bk * bc * sizeof(float));
     }
 }
 
@@ -169,6 +154,7 @@ static void distributed_softmax_blocks(float *S, int bn, MPI_Comm row_comm) {
 
         float gmax;
         MPI_Allreduce(&lmax, &gmax, 1, MPI_FLOAT, MPI_MAX, row_comm);
+        profiler_count_msg((long)sizeof(float));
 
         float lsum = 0.0f;
         for (int b = 0; b < bn; b++) {
@@ -178,6 +164,7 @@ static void distributed_softmax_blocks(float *S, int bn, MPI_Comm row_comm) {
 
         float gsum;
         MPI_Allreduce(&lsum, &gsum, 1, MPI_FLOAT, MPI_SUM, row_comm);
+        profiler_count_msg((long)sizeof(float));
 
         for (int b = 0; b < bn; b++) S[a * bn + b] /= gsum;
     }
@@ -200,14 +187,17 @@ static void scatter_blocks_2d(const float *full, float *block_buf,
                         tmp[a * bc + b] = full[(pi * br + a) * C + (pj * bc + b)];
                 int dest, rc[2] = {pi, pj};
                 MPI_Cart_rank(cart, rc, &dest);
-                if (dest == 0)
+                if (dest == 0) {
                     memcpy(block_buf, tmp, (size_t)br * bc * sizeof(float));
-                else
+                } else {
                     MPI_Send(tmp, br * bc, MPI_FLOAT, dest, 77, cart);
+                    profiler_count_msg((long)br * bc * sizeof(float));
+                }
                 free(tmp);
             }
     } else {
         MPI_Recv(block_buf, br * bc, MPI_FLOAT, 0, 77, cart, MPI_STATUS_IGNORE);
+        profiler_count_msg((long)br * bc * sizeof(float));
     }
 }
 
@@ -225,10 +215,12 @@ static void gather_blocks_2d(float *full, const float *block_buf,
                 float *tmp = malloc((size_t)br * bc * sizeof(float));
                 int src, rc[2] = {pi, pj};
                 MPI_Cart_rank(cart, rc, &src);
-                if (src == 0)
+                if (src == 0) {
                     memcpy(tmp, block_buf, (size_t)br * bc * sizeof(float));
-                else
+                } else {
                     MPI_Recv(tmp, br * bc, MPI_FLOAT, src, 78, cart, MPI_STATUS_IGNORE);
+                    profiler_count_msg((long)br * bc * sizeof(float));
+                }
                 for (int a = 0; a < br; a++)
                     for (int b = 0; b < bc; b++)
                         full[(pi * br + a) * C + (pj * bc + b)] = tmp[a * bc + b];
@@ -236,6 +228,7 @@ static void gather_blocks_2d(float *full, const float *block_buf,
             }
     } else {
         MPI_Send(block_buf, br * bc, MPI_FLOAT, 0, 78, cart);
+        profiler_count_msg((long)br * bc * sizeof(float));
     }
 }
 

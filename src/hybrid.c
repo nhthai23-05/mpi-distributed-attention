@@ -46,6 +46,7 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
     tensor_zero(&Og);
 
     /* The global root (rank 0) extracts each group's slice and sends to the group root */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     if (rank == 0) {
         /* Own group: copy directly */
@@ -74,6 +75,8 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
             MPI_Send(tmp_q, seq_len * gc, MPI_FLOAT, dest_rank, 10, comm);
             MPI_Send(tmp_k, seq_len * gc, MPI_FLOAT, dest_rank, 11, comm);
             MPI_Send(tmp_v, seq_len * gc, MPI_FLOAT, dest_rank, 12, comm);
+            for (int t = 0; t < 3; t++)
+                profiler_count_msg((long)seq_len * gc * sizeof(float));
             free(tmp_q); free(tmp_k); free(tmp_v);
         }
     } else if (sub_rank == 0 && my_group > 0) {
@@ -81,6 +84,8 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
         MPI_Recv(Qg.data, seq_len * group_cols, MPI_FLOAT, 0, 10, comm, MPI_STATUS_IGNORE);
         MPI_Recv(Kg.data, seq_len * group_cols, MPI_FLOAT, 0, 11, comm, MPI_STATUS_IGNORE);
         MPI_Recv(Vg.data, seq_len * group_cols, MPI_FLOAT, 0, 12, comm, MPI_STATUS_IGNORE);
+        for (int t = 0; t < 3; t++)
+            profiler_count_msg((long)seq_len * group_cols * sizeof(float));
     }
     profiler_stop(TIMER_COMM);
 
@@ -117,6 +122,7 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
     }
 
     /* Collect results from each group's root back to global root (rank 0) */
+    profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
     if (rank == 0) {
         /* Copy own group result directly */
@@ -131,6 +137,7 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
             float *tmp   = malloc((size_t)seq_len * gc * sizeof(float));
 
             MPI_Recv(tmp, seq_len * gc, MPI_FLOAT, src_rank, 20, comm, MPI_STATUS_IGNORE);
+            profiler_count_msg((long)seq_len * gc * sizeof(float));
 
             for (int i = 0; i < seq_len; i++)
                 memcpy(&AT(*out_full, i, gs * d_k), tmp + i * gc, gc * sizeof(float));
@@ -138,6 +145,7 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
         }
     } else if (sub_rank == 0 && my_group > 0) {
         MPI_Send(Og.data, seq_len * group_cols, MPI_FLOAT, 0, 20, comm);
+        profiler_count_msg((long)seq_len * group_cols * sizeof(float));
     }
     profiler_stop(TIMER_COMM);
 

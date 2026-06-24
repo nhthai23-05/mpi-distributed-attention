@@ -50,7 +50,9 @@ static void usage(const char *prog) {
         "                                      (needs perfect-square procs)\n"
         "  --csv                               output CSV timing line per rank\n"
         "  --no-check                          skip correctness check\n"
-        "  --progress                          print rank-0 progress + ETA to stderr\n",
+        "  --progress                          print rank-0 progress + ETA to stderr\n"
+        "  --profile-wait                      add barriers to separate idle WAIT\n"
+        "                                      time from real transfer time\n",
         prog, DEFAULT_SEQ_LEN, DEFAULT_NUM_HEADS, DEFAULT_D_MODEL);
 }
 
