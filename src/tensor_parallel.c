@@ -72,16 +72,17 @@ static void tp_allgather(const Tensor *Q_full, const Tensor *K_full,
      * softmax is per-row and this rank holds full K,V), so we reuse the shared
      * streaming kernel — identical math to the sequential baseline. */
     profiler_start(TIMER_COMPUTE);
-    float *srow = malloc((size_t)seq_len * sizeof(float));
-
     progress_begin("tensor-attn rows", my_rows);
-    for (int i = 0; i < my_rows; i++) {
-        attention_row(&Qb[(size_t)i * d_k], Kf, Vf, seq_len, d_k,
-                      &Ob[(size_t)i * d_k], srow);
-        progress_update(i + 1);
+    #pragma omp parallel
+    {
+        float *srow = malloc((size_t)seq_len * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int i = 0; i < my_rows; i++)
+            attention_row(&Qb[(size_t)i * d_k], Kf, Vf, seq_len, d_k,
+                          &Ob[(size_t)i * d_k], srow);
+        free(srow);
     }
     progress_end();
-    free(srow);
     profiler_stop(TIMER_COMPUTE);
 
     /* Gather output rows back to root */
@@ -321,13 +322,168 @@ static void tp_cannon(const Tensor *Q_full, const Tensor *K_full,
 }
 
 /* ================================================================== */
+/*  RING PATH — sharded K,V streamed around a ring + online softmax    */
+/*                                                                     */
+/*  Each rank owns a contiguous block of N/P QUERY rows AND a block of */
+/*  N/P key/value rows (K,V are NOT replicated). The K,V blocks are    */
+/*  passed around a ring; at each of the P steps a rank folds the block */
+/*  it currently holds into a running (Flash-style) online softmax over */
+/*  its local queries, so it never materializes the full score row and  */
+/*  never holds more than O(N/P) of K,V. The shift is double-buffered    */
+/*  with MPI_Isend/Irecv so the transfer overlaps the compute.          */
+/*                                                                     */
+/*  Result is exact up to floating-point reassociation (keys are summed */
+/*  in a different order than the sequential baseline, ~1e-6, like      */
+/*  Cannon). Works for ANY process count.                               */
+/* ================================================================== */
+static void tp_ring(const Tensor *Q_full, const Tensor *K_full,
+                    const Tensor *V_full, Tensor *out_full, MPI_Comm comm) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    int seq_len = (rank == 0) ? Q_full->rows : 0;
+    int d_k     = (rank == 0) ? Q_full->cols : 0;
+    MPI_Bcast(&seq_len, 1, MPI_INT, 0, comm);
+    MPI_Bcast(&d_k,     1, MPI_INT, 0, comm);
+
+    int base = seq_len / size;
+    int rem  = seq_len % size;
+    int my_rows  = base + (rank < rem ? 1 : 0);
+    int max_rows = base + (rem > 0 ? 1 : 0);   /* largest block (ring buffer size) */
+
+    /* Same row partition for Q, K and V (rank r owns rows [.., ..)). */
+    int *cnt = malloc(size * sizeof(int));
+    int *dsp = malloc(size * sizeof(int));
+    int *rows_of = malloc(size * sizeof(int));   /* rows in each rank's block */
+    int off = 0;
+    for (int r = 0; r < size; r++) {
+        int rr = base + (r < rem ? 1 : 0);
+        rows_of[r] = rr;
+        cnt[r] = rr * d_k;
+        dsp[r] = off;
+        off   += rr * d_k;
+    }
+
+    float *Qb = malloc((size_t)max_rows * d_k * sizeof(float));   /* local queries  */
+    float *Kc = calloc((size_t)max_rows * d_k, sizeof(float));    /* K block (cur)  */
+    float *Vc = calloc((size_t)max_rows * d_k, sizeof(float));    /* V block (cur)  */
+    float *Kn = malloc((size_t)max_rows * d_k * sizeof(float));   /* K block (next) */
+    float *Vn = malloc((size_t)max_rows * d_k * sizeof(float));   /* V block (next) */
+    float *Ob = malloc((size_t)max_rows * d_k * sizeof(float));   /* output rows    */
+
+    /* online-softmax state per local query row */
+    float *m   = malloc((size_t)max_rows * sizeof(float));        /* running max */
+    float *l   = malloc((size_t)max_rows * sizeof(float));        /* running sum */
+    float *acc = calloc((size_t)max_rows * d_k, sizeof(float));   /* running sum p*V */
+    for (int i = 0; i < my_rows; i++) { m[i] = -INFINITY; l[i] = 0.0f; }
+
+    /* Scatter each rank its own block of Q, K and V (no broadcast of full K,V). */
+    profiler_wait_barrier(comm);
+    profiler_start(TIMER_COMM);
+    MPI_Scatterv(rank == 0 ? Q_full->data : NULL, cnt, dsp, MPI_FLOAT,
+                 Qb, my_rows * d_k, MPI_FLOAT, 0, comm);
+    MPI_Scatterv(rank == 0 ? K_full->data : NULL, cnt, dsp, MPI_FLOAT,
+                 Kc, my_rows * d_k, MPI_FLOAT, 0, comm);
+    MPI_Scatterv(rank == 0 ? V_full->data : NULL, cnt, dsp, MPI_FLOAT,
+                 Vc, my_rows * d_k, MPI_FLOAT, 0, comm);
+    profiler_count_msg((long)my_rows * d_k * sizeof(float) * 3);
+    profiler_stop(TIMER_COMM);
+
+    float scale = 1.0f / sqrtf((float)d_k);
+    int next = (rank + 1) % size;
+    int prev = (rank - 1 + size) % size;
+
+    progress_begin("ring-attn steps", size);
+    for (int step = 0; step < size; step++) {
+        /* The block we currently hold originated on rank `src`. */
+        int src = (rank - step + size) % size;
+        int blk_rows = rows_of[src];
+
+        /* Prefetch the next block while we compute on the current one (overlap). */
+        MPI_Request reqs[4];
+        int nreq = 0;
+        if (step < size - 1) {
+            profiler_start(TIMER_COMM);
+            MPI_Irecv(Kn, max_rows * d_k, MPI_FLOAT, prev, 50, comm, &reqs[nreq++]);
+            MPI_Irecv(Vn, max_rows * d_k, MPI_FLOAT, prev, 51, comm, &reqs[nreq++]);
+            MPI_Isend(Kc, max_rows * d_k, MPI_FLOAT, next, 50, comm, &reqs[nreq++]);
+            MPI_Isend(Vc, max_rows * d_k, MPI_FLOAT, next, 51, comm, &reqs[nreq++]);
+            profiler_count_msg((long)max_rows * d_k * sizeof(float) * 2);  /* K,V */
+            profiler_stop(TIMER_COMM);
+        }
+
+        /* Fold this block into the online softmax for every local query row.
+         * Each i is independent (private m/l/acc row), so it threads cleanly. */
+        profiler_start(TIMER_COMPUTE);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < my_rows; i++) {
+            const float *qi = &Qb[(size_t)i * d_k];
+            float *ai = &acc[(size_t)i * d_k];
+            float mi = m[i], li = l[i];
+            for (int j = 0; j < blk_rows; j++) {
+                const float *kj = &Kc[(size_t)j * d_k];
+                float dot = 0.0f;
+                for (int k = 0; k < d_k; k++) dot += qi[k] * kj[k];
+                float s = dot * scale;
+                if (s > mi) {                 /* new running max -> rescale history */
+                    float corr = expf(mi - s);   /* mi=-inf at start => corr=0 */
+                    for (int k = 0; k < d_k; k++) ai[k] *= corr;
+                    li *= corr;
+                    mi = s;
+                }
+                float p = expf(s - mi);
+                li += p;
+                const float *vj = &Vc[(size_t)j * d_k];
+                for (int k = 0; k < d_k; k++) ai[k] += p * vj[k];
+            }
+            m[i] = mi; l[i] = li;
+        }
+        profiler_stop(TIMER_COMPUTE);
+
+        /* Finish the shift; the buffer we received becomes current. */
+        if (step < size - 1) {
+            profiler_start(TIMER_COMM);
+            MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+            profiler_stop(TIMER_COMM);
+            float *t;
+            t = Kc; Kc = Kn; Kn = t;
+            t = Vc; Vc = Vn; Vn = t;
+        }
+        progress_update(step + 1);
+    }
+    progress_end();
+
+    /* Normalize: o_i = acc_i / l_i. */
+    profiler_start(TIMER_COMPUTE);
+    for (int i = 0; i < my_rows; i++) {
+        float inv = (l[i] != 0.0f) ? 1.0f / l[i] : 0.0f;
+        for (int k = 0; k < d_k; k++) Ob[(size_t)i * d_k + k] = acc[(size_t)i * d_k + k] * inv;
+    }
+    profiler_stop(TIMER_COMPUTE);
+
+    profiler_wait_barrier(comm);
+    profiler_start(TIMER_COMM);
+    MPI_Gatherv(Ob, my_rows * d_k, MPI_FLOAT,
+                rank == 0 ? out_full->data : NULL, cnt, dsp, MPI_FLOAT, 0, comm);
+    profiler_count_msg((long)my_rows * d_k * sizeof(float));
+    profiler_stop(TIMER_COMM);
+
+    free(Qb); free(Kc); free(Vc); free(Kn); free(Vn); free(Ob);
+    free(m); free(l); free(acc);
+    free(cnt); free(dsp); free(rows_of);
+}
+
+/* ================================================================== */
 /*  Public dispatch                                                    */
 /* ================================================================== */
 void tensor_parallel_attention(const Tensor *Q_full, const Tensor *K_full,
                                 const Tensor *V_full, Tensor *out_full,
-                                int use_cannon, MPI_Comm comm) {
-    if (use_cannon)
-        tp_cannon(Q_full, K_full, V_full, out_full, comm);
-    else
-        tp_allgather(Q_full, K_full, V_full, out_full, comm);
+                                TPVariant variant, MPI_Comm comm) {
+    switch (variant) {
+        case TP_CANNON: tp_cannon(Q_full, K_full, V_full, out_full, comm);    break;
+        case TP_RING:   tp_ring(Q_full, K_full, V_full, out_full, comm);      break;
+        case TP_1D:
+        default:        tp_allgather(Q_full, K_full, V_full, out_full, comm); break;
+    }
 }

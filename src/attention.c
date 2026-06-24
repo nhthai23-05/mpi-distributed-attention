@@ -37,14 +37,20 @@ void attention_seq(const Tensor *Q, const Tensor *K, const Tensor *V, Tensor *ou
     int seq_len = Q->rows;
     int d_k     = Q->cols;
 
-    /* Streaming: one query row at a time, O(seq_len) scratch — no seq_len x
-     * seq_len score matrix, so this scales to large N without the quadratic
-     * memory (and integer-index) blow-up of the old materialized path. */
-    float *s = (float *)malloc((size_t)seq_len * sizeof(float));
-    for (int i = 0; i < seq_len; i++)
-        attention_row(&AT(*Q, i, 0), K->data, V->data, seq_len, d_k,
-                      &AT(*out, i, 0), s);
-    free(s);
+    /* Streaming + thread-parallel over query rows. Each query row is an
+     * independent computation, so we split them across OpenMP threads; every
+     * thread keeps its own O(seq_len) score scratch (no shared state, and still
+     * no seq_len x seq_len matrix). Without -fopenmp this runs as a plain serial
+     * loop with a single scratch buffer. */
+    #pragma omp parallel
+    {
+        float *s = (float *)malloc((size_t)seq_len * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int i = 0; i < seq_len; i++)
+            attention_row(&AT(*Q, i, 0), K->data, V->data, seq_len, d_k,
+                          &AT(*out, i, 0), s);
+        free(s);
+    }
 }
 
 void mha_seq(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,

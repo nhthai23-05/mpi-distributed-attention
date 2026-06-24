@@ -75,8 +75,10 @@ $\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\!\big(QK^{\top}/\sqrt{d_k}\big)V$,
 implemented from scratch in C with OpenMPI (no deep-learning frameworks). Three
 strategies are compared against a sequential baseline: \emph{head parallelism}
 (task decomposition), \emph{tensor parallelism} (data decomposition, with a 1D
-row-block path and a 2D Cannon path), and a \emph{hybrid} scheme that splits the
-processes into groups via \code{MPI\_Comm\_split}. We describe the level of
+row-block path, a 2D Cannon path, and a ring/Flash-style path that streams sharded
+$K,V$ through an online softmax), and a \emph{hybrid} scheme that splits the
+processes into groups via \code{MPI\_Comm\_split}; within each rank an OpenMP layer
+adds shared-memory parallelism. We describe the level of
 parallelism, the decomposition and mapping, the communication strategy and
 topology, and load balancing; give pseudocode; and report correctness plus three
 experiments: execution time vs.\ input size $N$, per-process granularity / load
@@ -155,6 +157,13 @@ data parallelism at the inner level.
 In short: \emph{head mode = task}, \emph{tensor mode = data}, \emph{hybrid =
 task over data}.
 
+\paragraph{A third level: shared-memory threads.} Within every MPI rank the
+per-query-row loop of the attention kernel is parallelized with \textbf{OpenMP}
+(\code{\#pragma omp parallel for}), each thread keeping a private score buffer.
+This adds a fine-grained shared-memory level beneath the MPI process level, so a
+configuration is described by both the process count $p$ and the per-rank thread
+count $t$ (reported as \code{threads=}$t$); with $t=1$ the runs are pure MPI.
+
 % =====================================================================
 \section{Decomposition technique}
 % =====================================================================
@@ -215,7 +224,18 @@ blocks of $K^{\top}$ and $V$) --- exactly the
 $n/\sqrt{p}\times n/\sqrt{p}$ block mapping. This path requires $p$ to be a
 perfect square and $N,d_k$ divisible by $\sqrt{p}$.
 
-\paragraph{Hybrid (2D logical grid: groups $\times$ ranks-per-group).}
+\paragraph{Tensor mode, ring (Flash-style).}
+The $N$ query rows \emph{and} the $N$ key/value rows are both partitioned into
+contiguous blocks of $N/p$, so rank $r$ owns its query block and only its own
+$N/p$ rows of $K,V$ (not the whole matrices). The $K,V$ blocks are streamed around
+a ring of the $p$ ranks with non-blocking \code{MPI\_Isend}/\code{MPI\_Irecv}
+double buffering; at each of the $p$ steps a rank folds the block it currently
+holds into a running, numerically stable \emph{online softmax} over its local
+queries (the Flash-attention update: keep a running max $m$, running denominator
+$\ell$, and running weighted sum, rescaling on each new max). It therefore never
+materializes a score row and never holds more than $O(N/p)$ of $K,V$, and the
+shift overlaps the compute. Works for any $p$; the result matches the baseline up
+to floating-point reassociation ($\sim10^{-7}$).
 \code{MPI\_Comm\_split} partitions \code{MPI\_COMM\_WORLD} into
 $G$ groups of $p/G$ processes (the colour is $\lfloor r/(p/G)\rfloor$). The $H$
 heads are split so each group owns $H/G$ heads (task level); within a group the
@@ -229,19 +249,19 @@ $H \bmod G = 0$ so the grid is rectangular.
 \paragraph{Master--slave (star).}
 Rank~0 is the master. It owns the full $Q,K,V$, distributes work, and collects
 results. In head and tensor mode this uses the collective
-\code{Scatterv}/\code{Bcast}/\code{Gatherv}; in hybrid mode the master sends each
-group's slice to that group's root with point-to-point
-\code{MPI\_Send}/\code{MPI\_Recv} (tags 10--12) and gathers the results back (tag
-20). Logically this is a star topology centred on rank~0.
+\code{Scatterv}/\code{Bcast}/\code{Gatherv}; in hybrid mode the master distributes
+each group's slice to the group roots with \code{MPI\_Scatter} and collects the
+results with \code{MPI\_Gather} over a dedicated group-roots sub-communicator
+(replacing an earlier serial \code{Send}/\code{Recv} fan-out). Logically this is a
+star topology centred on rank~0.
 
 \paragraph{Blocking vs.\ non-blocking.}
-All communication is \textbf{blocking}. Collectives
-(\code{MPI\_Bcast}, \code{MPI\_Scatterv}, \code{MPI\_Gatherv},
-\code{MPI\_Allreduce}) and the point-to-point calls
-(\code{MPI\_Send}/\code{MPI\_Recv}, \code{MPI\_Sendrecv\_replace}) all return only
-after the operation has progressed. This keeps the code simple and correct; the
-trade-off (no compute/comm overlap) is discussed in
-Section~\ref{sec:discussion}.
+The head, 1D-tensor, Cannon and hybrid paths use \textbf{blocking} collectives and
+point-to-point calls, which keeps them simple and correct at the cost of no
+compute/communication overlap. The \textbf{ring} path instead uses
+\textbf{non-blocking} \code{MPI\_Isend}/\code{MPI\_Irecv} closed by an
+\code{MPI\_Waitall}, deliberately overlapping each $K,V$ shift with the
+online-softmax compute of the block currently held (Section~\ref{sec:discussion}).
 
 \paragraph{Topologies in use.}
 \begin{itemize}[leftmargin=1.4em]
@@ -270,7 +290,8 @@ Mode & Distribute & Reduce/exchange & Collect \\
 Head (M1)        & \code{Scatterv}                 & ---                                & \code{Gatherv} \\
 Tensor 1D (M2)   & \code{Scatterv}(Q), \code{Bcast}(K,V) & ---                          & \code{Gatherv} \\
 Tensor Cannon    & 2D block scatter (\code{Send})  & \code{Sendrecv\_replace}, \code{Allreduce} & 2D block gather \\
-Hybrid (M3)      & \code{Comm\_split}, \code{Send} + inner M2 & inner M2                & \code{Recv} \\
+Tensor Ring      & \code{Scatterv}(Q,K,V)          & \code{Isend}/\code{Irecv} ring shifts & \code{Gatherv} \\
+Hybrid (M3)      & \code{Comm\_split}, \code{Scatter} + inner M2 & inner M2          & \code{Gather} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -336,30 +357,57 @@ function TP_ATTENTION_CANNON(Q, K, V) on $\sqrt{p}\times\sqrt{p}$ torus:
     gather O blocks -> rank 0
 \end{lstlisting}
 
+\noindent\textbf{M2 --- ring (Flash-style) path} (sharded $K,V$, overlapped).
+\begin{lstlisting}
+function TP_ATTENTION_RING(Q, K, V) on a ring of p ranks:
+    scatter row-blocks of Q, K, V -> Q_loc, K_blk, V_blk    # each rank: N/p rows
+    m[i] $\gets -\infty$;  l[i] $\gets$ 0;  acc[i] $\gets$ 0          # online-softmax state
+    for step in 0..p-1:
+        if step < p-1: Isend(K_blk,V_blk -> next); Irecv(<- prev)   # overlap shift
+        foreach local query i, each key j in current block:    # parallel-for (OpenMP)
+            s $\gets$ (Q_loc[i] $\cdot$ K_blk[j]) / $\sqrt{d_k}$
+            if s > m[i]: rescale acc[i],l[i] by exp(m[i]-s); m[i] $\gets$ s   # new max
+            p $\gets$ exp(s - m[i]); l[i] += p; acc[i] += p * V_blk[j]
+        if step < p-1: Waitall; swap current <- received block
+    O_loc[i] $\gets$ acc[i] / l[i]
+    gather O_loc -> rank 0
+\end{lstlisting}
+
 \noindent\textbf{M3 --- Hybrid.}
 \begin{lstlisting}
 function HYBRID_MHA(Q, K, V, H heads, G groups) on p ranks:
-    split COMM_WORLD into G groups of p/G ranks       # MPI_Comm_split
-    master (rank 0) sends each group its H/G head-columns   # Send/Recv
-    for each head h owned by my group:                # task level
-        O_h $\gets$ TP_ATTENTION_1D(Q_h, K_h, V_h) on my group  # data level
-    group roots send results back to master           # Send/Recv
+    split COMM_WORLD into G groups of p/G ranks         # MPI_Comm_split
+    build a sub-communicator of the G group roots       # MPI_Comm_split
+    master scatters each group its H/G head-columns     # MPI_Scatter (roots comm)
+    for each head h owned by my group:                  # task level
+        O_h $\gets$ TP_ATTENTION_1D(Q_h, K_h, V_h) on my group   # data level
+    master gathers results from the group roots         # MPI_Gather (roots comm)
 \end{lstlisting}
 
 % =====================================================================
 \section{Profiling methodology}
 % =====================================================================
-Timing uses \code{MPI\_Wtime} through a small profiler that accumulates three
-categories per rank: \textbf{I/O} (input generation), \textbf{compute} (the local
-matrix work), and \textbf{communication} (every MPI call). Each parallel kernel
-brackets its phases with \code{profiler\_start}/\code{profiler\_stop}, so the
-``with communication'' time is $t_{\text{compute}}+t_{\text{comm}}$ and the
-``without communication'' time is $t_{\text{compute}}$ alone. With \code{--csv}
-the program prints one line per rank
-(\code{rank,seq\_len,t\_io,t\_compute,t\_comm}); the benchmark scripts collect
-these into \code{results/*.csv}, which \code{scripts/make\_charts.py} turns into
-the figures below. Long runs can be watched live with \code{--progress}, which
-prints a rank-0 percentage and ETA to \code{stderr}.
+Timing uses \code{MPI\_Wtime} through a small profiler that accumulates four time
+categories per rank --- \textbf{I/O} (input generation), \textbf{compute} (local
+matrix work), \textbf{communication} (time inside MPI data-transfer calls), and
+\textbf{wait} (idle time blocked at a synchronization point) --- together with two
+communication-volume counters, \textbf{msgs} (number of MPI data transfers the rank
+took part in) and \textbf{bytes} (volume it sent/received), and a one-off ping-pong
+probe that measures the cluster's worst-case one-way \textbf{link latency}. Each
+parallel kernel brackets its phases with
+\code{profiler\_start}/\code{profiler\_stop}, so the ``with communication'' time is
+$t_{\text{compute}}+t_{\text{comm}}$ and the ``without communication'' time is
+$t_{\text{compute}}$ alone. Wait is separated from real transfer by bracketing an
+\code{MPI\_Barrier} into the wait timer just before each collective (enabled with
+\code{--profile-wait}; off by default so headline timing runs are unperturbed). With
+\code{--csv} the program prints one line per rank
+(\code{rank,seq\_len,t\_io,t\_compute,t\_comm,t\_wait,msgs,bytes,latency\_us}); the
+benchmark scripts collect these into \code{results/*.csv}, which
+\code{scripts/make\_charts.py} turns into the figures below --- Chart~C stacks
+compute/comm/wait per rank and annotates message and byte totals, and Chart~D adds a
+communication-volume and link-latency panel versus $p$. Long runs can be watched
+live with \code{--progress}, which prints a rank-0 percentage and ETA to
+\code{stderr}.
 
 % =====================================================================
 \section{Results}
@@ -433,41 +481,94 @@ $p=X$ (oversubscription past physical cores) speedup typically flattens or dips.
 \TODO{Relate the diminishing return to Amdahl's law and the communication share
 measured in Chart~C.}
 
+\subsection{Chart E --- ring vs.\ 1D tensor path}
+\textbf{Setup.} The same single-head problem at a fixed $N$, swept over $p$
+(\code{scripts/bench\_ring\_vs\_1d.sh}). The left panel is the measured total time
+(compute\,+\,comm\,+\,wait); the right panel is the peak number of $K,V$ rows
+resident per rank.
+
+\chartfig{results/chart-ring-vs-1d.png}
+  {Ring vs.\ 1D: measured time and per-rank $K,V$ memory footprint.}{fig:e}
+
+\noindent\textbf{Observation.} The 1D path broadcasts all keys, so every rank
+holds $N$ rows of $K,V$; the ring path shards them, so each rank holds only
+$\lceil N/p\rceil$ --- a footprint that falls with $p$ while 1D stays flat. The
+\emph{total} bytes moved are comparable (one broadcast vs.\ $p-1$ smaller shifts),
+so the ring's advantage is memory and overlap rather than volume. \TODO{On the
+cluster, report whether the ring's overlapped, smaller transfers also lower total
+time at large $N$; on a single shared-memory node, where communication is nearly
+free, the online-softmax overhead can make the ring slightly slower.}
+
+\subsection{Chart F --- OpenMP thread scaling}
+\textbf{Setup.} One MPI rank, varying \code{OMP\_NUM\_THREADS}
+(\code{scripts/bench\_threads.sh}); pure compute, no communication.
+
+\chartfig{results/chart-threads.png}
+  {Intra-node OpenMP runtime and speedup vs.\ thread count.}{fig:f}
+
+\noindent\textbf{Observation.} \TODO{Report the thread speedup at $t=$ cores.} It
+plateaus well before the core count because the kernel re-reads $K,V$ for every
+query row and is therefore \emph{memory-bandwidth bound}; this is exactly why the
+sharded ring path (per-rank $K,V$ block of only $N/p$ rows) is the more scalable
+route at large $N$.
+
 % =====================================================================
-\section{Discussion: bottlenecks and possible improvements}
+\section{Discussion: improvements and remaining limitations}
 \label{sec:discussion}
 % =====================================================================
+\paragraph{Improvements implemented.}
 \begin{itemize}[leftmargin=1.4em]
-\item \textbf{Naive $\mathcal{O}(N^2 d_k)$ kernels.} The matrix multiplies are
-straightforward triple loops (the output accumulation reads $V$ row-by-row for
-cache friendliness). They are not blocked/vectorized like BLAS, so absolute
-times are large; this is acceptable for a parallelism study but bounds
-single-node throughput.
-\item \textbf{Broadcast of full $K,V$.} The 1D path replicates all keys and
-values on every process ($\mathcal{O}(Nd_k)$ per process), which is simple and
-needs no cross-process reduction for softmax, but does not reduce the memory or
-bandwidth per node. For very large $N$ this is the main communication cost.
-\item \textbf{Blocking communication.} There is no overlap of communication with
-computation. Non-blocking \code{MPI\_Isend}/\code{MPI\_Irecv} with computation in
-flight could hide part of the broadcast/gather latency.
-\item \textbf{Master serialization in hybrid.} Rank~0 distributes and collects
-each group's data with point-to-point calls in a loop; for many groups this
-serial fan-out/fan-in is a scaling limit that a collective over a group-root
-sub-communicator would relieve.
+\item \textbf{Streaming online-softmax kernel.} The kernel processes one query row
+at a time with $\mathcal{O}(N)$ scratch instead of materializing the $N\times N$
+score matrix, removing the quadratic-memory wall and letting $N$ scale far past the
+old limit (the $N$ sweep now runs to $65536$).
+\item \textbf{Ring (Flash-style) tensor path.} Replaces the full-$K,V$ broadcast
+with sharded $\mathcal{O}(N/p)$-per-rank storage streamed around a ring; the shift
+is non-blocking and overlaps the compute. This addresses both the ``replicate all
+of $K,V$'' memory cost and the ``no compute/comm overlap'' of the 1D path. (Total
+bytes moved are comparable --- one broadcast vs.\ $p-1$ smaller shifts --- so the
+gains are memory footprint and hidden latency, most visible on a real network and at
+large $N$; Chart~E.)
+\item \textbf{Collective hybrid distribution.} The master now fans out and collects
+each group's slice with \code{MPI\_Scatter}/\code{MPI\_Gather} over a group-roots
+sub-communicator ($\mathcal{O}(\log G)$) instead of a serial rank-0
+\code{Send}/\code{Recv} loop ($\mathcal{O}(G)$).
+\item \textbf{Shared-memory threads.} OpenMP parallelizes the per-query-row loop
+within each rank, adding a second (intra-node) level for a hybrid MPI\,+\,OpenMP
+execution (Chart~F).
+\item \textbf{Richer profiling.} Per rank we separate compute, communication and
+idle \emph{wait}, and count messages, bytes, and a measured link latency, so a slow
+run can be explained (e.g.\ communication-bound at small $N$).
+\end{itemize}
+
+\paragraph{Remaining limitations.}
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Memory-bandwidth-bound kernel.} The inner loops re-read $K,V$ for
+every query row, so single-node OpenMP speedup plateaus well before the core count
+(Chart~F). Cache/query \emph{blocking} (FlashAttention-style tiling) would raise
+arithmetic intensity and let the threads scale further; it is left out because it
+would forgo the bit-exact match the 1D/sequential paths currently provide.
+\item \textbf{Scalar kernels.} The matrix work is portable C (auto-vectorized at
+\code{-O2}) rather than blocked/hand-tuned BLAS, so absolute throughput is modest;
+acceptable for a parallelism study.
 \item \textbf{Busy-wait at 100\% CPU.} OpenMPI spins inside blocking calls, so a
 waiting rank still shows full CPU utilization --- high CPU does not imply useful
-work. This matters when interpreting cluster monitoring during a run.
+work. The \code{--profile-wait} timer makes that idle time measurable
+(Chart~C).
 \end{itemize}
 
 % =====================================================================
 \section{Conclusion}
 % =====================================================================
 We implemented multi-head attention in C\,+\,MPI and parallelized it three ways:
-head (task), tensor (data; 1D row-block and 2D Cannon), and hybrid
-(task\,$\times$\,data via \code{MPI\_Comm\_split}). All parallel paths reproduce
-the sequential result within tolerance. The experiments characterize runtime vs.\
-problem size, per-process load balance, and speedup with and without
-communication, isolating the cost of communication throughout.
+head (task), tensor (data; 1D row-block, 2D Cannon, and a ring/Flash-style path
+that streams sharded $K,V$ through an online softmax), and hybrid
+(task\,$\times$\,data via \code{MPI\_Comm\_split}), with an OpenMP layer adding
+shared-memory parallelism inside each rank. All parallel paths reproduce the
+sequential result within tolerance. The experiments characterize runtime vs.\
+problem size, per-process load balance, speedup with and without communication,
+the ring-vs-1D memory/overlap trade-off, and intra-node thread scaling, isolating
+the cost of communication throughout.
 \TODO{One or two sentences summarizing your measured speedup and load balance.}
 
 % =====================================================================

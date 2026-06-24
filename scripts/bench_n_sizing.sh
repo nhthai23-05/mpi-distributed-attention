@@ -12,6 +12,9 @@
 # Force C locale so awk/printf use '.' decimals — a ',' decimal (some locales)
 # would corrupt the comma-separated CSV and break the arithmetic below.
 export LC_ALL=C
+# Keep this MPI-scaling benchmark single-threaded by default so the numbers
+# reflect pure MPI process scaling. Override with OMP_NUM_THREADS=N for hybrid runs.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 BINARY="./hybrid_attention"
 MODE="${MODE:-hybrid}"
@@ -24,7 +27,7 @@ mkdir -p "$RESULTS_DIR"
 OUT="$RESULTS_DIR/n_sizing.csv"
 TMP="$RESULTS_DIR/.n_sizing_run.csv"   # holds ONE run's output, parsed per-iteration
 
-echo "rank,seq_len,t_io,t_compute,t_comm" > "$OUT"
+echo "rank,seq_len,t_io,t_compute,t_comm,t_wait,msgs,bytes,latency_us" > "$OUT"
 
 echo "N-sizing sweep: mode=$MODE  procs=$TOTAL_PROCS  stop-at >= ${TARGET_S}s"
 echo ""
@@ -32,7 +35,9 @@ echo ""
 sweep_start=$SECONDS
 
 # Sweep N — start small to calibrate, grow until a step crosses the target window.
-for N in 64 128 256 512 1024 2048 4096 8192; do
+# The streaming online-softmax kernel uses O(N) scratch (no N x N score matrix),
+# so N can now go well past 8192 without the old quadratic-memory wall.
+for N in 64 128 256 512 1024 2048 4096 8192 16384 32768 65536; do
     echo "  [N=$N] running ..."
     step_start=$SECONDS
 
@@ -63,7 +68,7 @@ for N in 64 128 256 512 1024 2048 4096 8192; do
     fi
 
     # Rough estimate for the next step: doubling N ~ 4x the O(N^2) work.
-    if [ "$N" -lt 8192 ]; then
+    if [ "$N" -lt 65536 ]; then
         est=$(( step_wall * 4 ))
         echo "    next: N=$(( N * 2 )) est ~${est}s (O(N^2): ~4x per doubling)"
     fi

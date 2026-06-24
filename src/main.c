@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "tensor.h"
 #include "data_gen.h"
@@ -48,6 +51,8 @@ static void usage(const char *prog) {
         "  --groups <G>                        groups for hybrid mode (default: 2)\n"
         "  --cannon                            tensor mode: use Cannon's algorithm\n"
         "                                      (needs perfect-square procs)\n"
+        "  --ring                              tensor mode: ring (Flash-style) attention\n"
+        "                                      sharded K,V + overlapped streaming softmax\n"
         "  --csv                               output CSV timing line per rank\n"
         "  --no-check                          skip correctness check\n"
         "  --progress                          print rank-0 progress + ETA to stderr\n"
@@ -63,6 +68,12 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+#ifdef _OPENMP
+    int omp_threads = omp_get_max_threads();   /* per-rank OpenMP threads */
+#else
+    int omp_threads = 1;
+#endif
+
     /* Parse arguments */
     Mode mode       = MODE_SEQ;
     int  seq_len    = DEFAULT_SEQ_LEN;
@@ -70,9 +81,11 @@ int main(int argc, char **argv) {
     int  d_model    = DEFAULT_D_MODEL;
     int  num_groups = 2;
     int  use_cannon = 0;
+    int  use_ring   = 0;
     int  csv_output = 0;
     int  do_check   = 1;
     int  show_progress = 0;
+    int  profile_wait  = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
@@ -92,12 +105,16 @@ int main(int argc, char **argv) {
             num_groups = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cannon") == 0) {
             use_cannon = 1;
+        } else if (strcmp(argv[i], "--ring") == 0) {
+            use_ring = 1;
         } else if (strcmp(argv[i], "--csv") == 0) {
             csv_output = 1;
         } else if (strcmp(argv[i], "--no-check") == 0) {
             do_check = 0;
         } else if (strcmp(argv[i], "--progress") == 0) {
             show_progress = 1;
+        } else if (strcmp(argv[i], "--profile-wait") == 0) {
+            profile_wait = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             if (rank == 0) usage(argv[0]);
             MPI_Finalize(); return 0;
@@ -113,6 +130,7 @@ int main(int argc, char **argv) {
         else if (num_heads <= 0)                why = "--heads must be > 0";
         else if (d_model   <= 0)                why = "--d-model must be > 0";
         else if (d_model % num_heads != 0)      why = "--d-model must be divisible by --heads";
+        else if (use_cannon && use_ring)        why = "--cannon and --ring are mutually exclusive";
         else if (mode == MODE_HYBRID) {
             if      (num_groups <= 0)             why = "--groups must be > 0";
             else if (size % num_groups != 0)     why = "process count must be divisible by --groups";
@@ -130,9 +148,10 @@ int main(int argc, char **argv) {
 
     /* Print CSV header once from rank 0 */
     if (csv_output && rank == 0)
-        printf("rank,seq_len,t_io,t_compute,t_comm\n");
+        printf("rank,seq_len,t_io,t_compute,t_comm,t_wait,msgs,bytes,latency_us\n");
 
     profiler_init();
+    profiler_enable_wait(profile_wait);
     progress_enable(show_progress);
 
     /* Allocate Q, K, V on all ranks (data_gen makes them identical everywhere) */
@@ -146,6 +165,12 @@ int main(int argc, char **argv) {
     data_gen_fill(&V, 3);
     profiler_stop(TIMER_IO);
 
+    /* One-off link-latency probe for the parallel modes. Done here — outside the
+     * timed kernel region and by ALL ranks together — so it reports the cluster's
+     * worst-case one-way latency without inflating compute/comm timings. */
+    if (mode != MODE_SEQ)
+        profiler_measure_latency(MPI_COMM_WORLD);
+
     /* Sequential baseline (rank 0 only, for correctness check) */
     Tensor out_seq = tensor_alloc(seq_len, d_model);
     Tensor out_par = tensor_alloc(seq_len, d_model);
@@ -156,8 +181,8 @@ int main(int argc, char **argv) {
         mha_seq(&Q, &K, &V, &out_seq, num_heads);
         double t1 = MPI_Wtime();
         if (!csv_output)
-            printf("[SEQ] time=%.4fs  seq_len=%d  d_model=%d  heads=%d\n",
-                   t1 - t0, seq_len, d_model, num_heads);
+            printf("[SEQ] time=%.4fs  seq_len=%d  d_model=%d  heads=%d  threads=%d\n",
+                   t1 - t0, seq_len, d_model, num_heads, omp_threads);
     }
 
     if (mode == MODE_SEQ) {
@@ -188,7 +213,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        tensor_parallel_attention(&Q1, &K1, &V1, &O1, use_cannon, MPI_COMM_WORLD);
+        TPVariant variant = use_cannon ? TP_CANNON : (use_ring ? TP_RING : TP_1D);
+        tensor_parallel_attention(&Q1, &K1, &V1, &O1, variant, MPI_COMM_WORLD);
 
         /* For correctness check, embed the single-head result into out_par */
         if (rank == 0) {
@@ -217,9 +243,9 @@ int main(int argc, char **argv) {
         MPI_Barrier(MPI_COMM_WORLD);
         profiler_print_csv(rank, seq_len);
     } else if (rank == 0) {
-        printf("[%s] wall=%.4fs  seq_len=%d  d_model=%d  heads=%d  procs=%d\n",
+        printf("[%s] wall=%.4fs  seq_len=%d  d_model=%d  heads=%d  procs=%d  threads=%d\n",
                mode == MODE_HEAD ? "HEAD" : mode == MODE_TENSOR ? "TENSOR" : "HYBRID",
-               wall_end - wall_start, seq_len, d_model, num_heads, size);
+               wall_end - wall_start, seq_len, d_model, num_heads, size, omp_threads);
         profiler_print_summary(rank);   /* IO / compute / comm split for rank 0 */
     }
 

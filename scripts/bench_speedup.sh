@@ -16,6 +16,9 @@
 # Force C locale so awk/printf use '.' decimals — a ',' decimal (some locales)
 # would corrupt the comma-separated CSV and break the speedup arithmetic.
 export LC_ALL=C
+# Single-threaded by default so the speedup curve is pure MPI process scaling.
+# Override with OMP_NUM_THREADS=N to measure the hybrid MPI+OpenMP speedup.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 BINARY="./hybrid_attention"
 MODE="${MODE:-tensor}"
@@ -29,7 +32,7 @@ mkdir -p "$RESULTS_DIR"
 OUT="$RESULTS_DIR/speedup.csv"
 TMP="$RESULTS_DIR/.speedup_tmp.csv"
 
-echo "procs,seq_len,t_wall_with_comm,t_wall_no_comm,speedup_with,speedup_no" > "$OUT"
+echo "procs,seq_len,t_wall_with_comm,t_wall_no_comm,speedup_with,speedup_no,msgs,bytes,latency_us" > "$OUT"
 
 echo "Running speedup benchmark: N=$INPUT_N (=2*$N), mode=$MODE"
 
@@ -46,6 +49,9 @@ mpirun --oversubscribe --prefix /usr \
 echo "    (wall $(( SECONDS - step_start ))s)"
 T1_COMPUTE=$(awk -F',' 'NR==1{print $4}' "$TMP")
 T1_COMM=$(awk -F',' 'NR==1{print $5}' "$TMP")
+T1_MSGS=$(awk -F',' 'NR==1{print $7}' "$TMP")
+T1_BYTES=$(awk -F',' 'NR==1{print $8}' "$TMP")
+T1_LAT=$(awk -F',' 'NR==1{print $9}' "$TMP")
 if [ -z "$T1_COMPUTE" ]; then
     echo "ERROR: no P=1 baseline row. Mode '$MODE' likely can't run at -np 1" >&2
     echo "       (hybrid needs P >= --groups). Re-run with MODE=tensor."          >&2
@@ -54,7 +60,7 @@ fi
 T1_WITH=$(awk "BEGIN{printf \"%.6f\", ${T1_COMPUTE:-0} + ${T1_COMM:-0}}")
 T1_NO="$T1_COMPUTE"
 echo "    t1_compute=${T1_COMPUTE}s  t1_comm=${T1_COMM}s"
-echo "1,$INPUT_N,$T1_WITH,$T1_NO,1.00,1.00" >> "$OUT"
+echo "1,$INPUT_N,$T1_WITH,$T1_NO,1.00,1.00,${T1_MSGS:-0},${T1_BYTES:-0},${T1_LAT:-0}" >> "$OUT"
 
 # Parallel runs: vary p = 2, 4, 8, ..., up to TOTAL_PROCS
 P=2
@@ -72,6 +78,9 @@ while [ "$P" -le "$TOTAL_PROCS" ]; do
     T_IO=$(awk -F',' 'NR==1{print $3}' "$TMP")
     T_COMPUTE=$(awk -F',' 'NR==1{print $4}' "$TMP")
     T_COMM=$(awk -F',' 'NR==1{print $5}' "$TMP")
+    T_MSGS=$(awk -F',' 'NR==1{print $7}' "$TMP")
+    T_BYTES=$(awk -F',' 'NR==1{print $8}' "$TMP")
+    T_LAT=$(awk -F',' 'NR==1{print $9}' "$TMP")
 
     T_WITH=$(awk "BEGIN{printf \"%.6f\", ${T_COMPUTE:-0} + ${T_COMM:-0}}")
     T_NO=$(awk   "BEGIN{printf \"%.6f\", ${T_COMPUTE:-0}}")
@@ -81,7 +90,8 @@ while [ "$P" -le "$TOTAL_PROCS" ]; do
 
     echo "    t_wall(with_comm)=${T_WITH}s  speedup=${SP_WITH}"
     echo "    t_wall(no_comm)  =${T_NO}s    speedup=${SP_NO}"
-    echo "$P,$INPUT_N,$T_WITH,$T_NO,$SP_WITH,$SP_NO" >> "$OUT"
+    echo "    packets=${T_MSGS:-0}  bytes=${T_BYTES:-0}  link_latency=${T_LAT:-0}us"
+    echo "$P,$INPUT_N,$T_WITH,$T_NO,$SP_WITH,$SP_NO,${T_MSGS:-0},${T_BYTES:-0},${T_LAT:-0}" >> "$OUT"
 
     P=$((P * 2))
 done

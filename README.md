@@ -28,13 +28,19 @@ verified against a single-process sequential baseline.
 | `tensor` (M2) | One head split across all processes | **Data** | `MPI_Bcast` / `MPI_Allreduce`; `MPI_Sendrecv_replace` (Cannon) |
 | `hybrid` (M3) | Processes split into groups; each group runs M2 on its heads | **Task + Data** | `MPI_Comm_split` + the above |
 
-**Tensor mode has two paths:**
-- **Default (1D):** row-block decomposition + local softmax. Works for any
-  process count; this is what `hybrid` uses internally.
+**Tensor mode has three paths:**
+- **Default (1D):** row-block decomposition + local softmax. Broadcasts the full
+  K,V to every rank. Works for any process count; this is what `hybrid` uses
+  internally. Bitwise-identical to the sequential baseline.
 - **Cannon (`--cannon`):** 2D block matrix multiply using `MPI_Sendrecv_replace`
   ring shifts + distributed softmax via `MPI_Allreduce` over a row
   sub-communicator. Requires a perfect-square process count and `seq_len`,
   `d_k` divisible by √P.
+- **Ring (`--ring`):** Flash-style attention — K,V are **sharded** (N/P rows per
+  rank, not replicated) and streamed around a ring with non-blocking
+  `MPI_Isend`/`MPI_Irecv` double buffering, folded into a running **online
+  softmax**. Each rank holds only O(N/P) of K,V and the shift overlaps the
+  compute. Works for any process count; matches the baseline to ~1e-7.
 
 ---
 
@@ -83,6 +89,11 @@ make            # builds ./hybrid_attention and ./mpi-prime
 make clean      # removes binaries and object files
 ```
 
+Built with **OpenMP** (`-fopenmp`): each MPI rank threads the per-query-row loop.
+Control the per-rank thread count with `OMP_NUM_THREADS` (e.g. `OMP_NUM_THREADS=4`)
+for a hybrid MPI+OpenMP run. The MPI-scaling benchmark scripts pin it to `1` by
+default so their numbers are pure MPI scaling.
+
 ---
 
 ## Run
@@ -102,8 +113,11 @@ Common options:
 | `--d-model <D>` | model dimension (`d_k = D / H`) | 512 |
 | `--groups <G>` | sub-comm groups for hybrid mode | 2 |
 | `--cannon` | tensor mode: use Cannon's algorithm | off |
-| `--csv` | emit per-rank timing as CSV | off |
+| `--ring` | tensor mode: ring (Flash-style) attention — sharded K,V + overlapped streaming softmax | off |
+| `--csv` | emit per-rank CSV: `rank,seq_len,t_io,t_compute,t_comm,t_wait,msgs,bytes,latency_us` | off |
 | `--no-check` | skip the correctness check | off |
+| `--progress` | print rank-0 progress + ETA to stderr | off |
+| `--profile-wait` | bracket barriers so idle WAIT time is split from real transfer | off |
 
 Examples:
 
@@ -149,10 +163,17 @@ TOTAL_PROCS=<cores> N=<chosen_N> MODE=hybrid bash scripts/bench_granularity.sh
 # Chart D — speedup as processes scale 1 → 2×cores
 # (tensor mode: same kernel at every P, including the P=1 anchor — hybrid can't run at P=1)
 TOTAL_PROCS=<2×cores> N=<chosen_N> MODE=tensor bash scripts/bench_speedup.sh
+
+# Chart E — ring vs 1D tensor path (algorithm comparison: memory + overlap)
+TOTAL_PROCS=<cores> N=<chosen_N> bash scripts/bench_ring_vs_1d.sh
+
+# Chart F — OpenMP thread scaling (1 MPI rank, vary threads)
+MAX_THREADS=<cores> N=<chosen_N> bash scripts/bench_threads.sh
 ```
 
-Each run separates **computation time** from **communication time** via
-`MPI_Wtime()`, so the charts can show both.
+Each run separates **computation**, **communication** and idle **wait** time via
+`MPI_Wtime()` and counts messages, bytes, and link latency, so the charts can show
+all of them. Turn the CSVs into figures with `python3 scripts/make_charts.py`.
 
 ---
 

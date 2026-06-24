@@ -1,6 +1,6 @@
 CC      = mpicc
-CFLAGS  = -O2 -Wall -Wextra -std=c11
-LDFLAGS = -lm
+CFLAGS  = -O2 -Wall -Wextra -std=c11 -fopenmp
+LDFLAGS = -lm -fopenmp
 TARGET  = hybrid_attention
 
 SRCS = src/main.c \

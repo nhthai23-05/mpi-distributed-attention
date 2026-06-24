@@ -1,11 +1,22 @@
 #include "hybrid.h"
 #include "tensor_parallel.h"
 #include "profiler.h"
-#include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
+/*
+ * M3 — Hybrid (task x data) attention.
+ *
+ * Processes split into `num_groups` groups via MPI_Comm_split (data level inside
+ * a group, task level across groups). Distribution and collection between the
+ * master and the group roots use a COLLECTIVE over a dedicated group-roots
+ * sub-communicator (MPI_Scatter / MPI_Gather) instead of a serial rank-0
+ * Send/Recv loop, so the fan-out/fan-in is O(log G) rather than O(G) and there
+ * is no master serialization bottleneck. Groups are equal size (main.c enforces
+ * size % G == 0 and heads % G == 0), so the per-group blocks are uniform and a
+ * plain Scatter/Gather suffices.
+ */
 void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full,
                 Tensor *out_full, int num_heads, int num_groups, MPI_Comm comm) {
     int rank, size;
@@ -17,79 +28,70 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
     MPI_Bcast(&seq_len, 1, MPI_INT, 0, comm);
     MPI_Bcast(&d_model, 1, MPI_INT, 0, comm);
 
-    int d_k = d_model / num_heads;
+    int d_k             = d_model / num_heads;
     int heads_per_group = num_heads / num_groups;
     int procs_per_group = size / num_groups;
+    int my_group        = rank / procs_per_group;
 
-    /* Assign each rank to a group (color) */
-    int my_group = rank / procs_per_group;
-    int my_color = my_group;
-
+    /* sub_comm: the ranks within one group (used for the inner 1D tensor kernel). */
     profiler_start(TIMER_COMM);
     MPI_Comm sub_comm;
-    MPI_Comm_split(comm, my_color, rank, &sub_comm);
-    profiler_stop(TIMER_COMM);
-
+    MPI_Comm_split(comm, my_group, rank, &sub_comm);
     int sub_rank, sub_size;
     MPI_Comm_rank(sub_comm, &sub_rank);
     MPI_Comm_size(sub_comm, &sub_size);
 
-    /* The root of each sub-comm (sub_rank == 0) needs the head slices for its group */
-    int head_start = my_group * heads_per_group;
+    /* roots_comm: exactly one rank per group (each group's root, sub_rank == 0),
+     * ordered by group so roots_comm rank g == group g's root, and global rank 0
+     * (group 0's root) is roots_comm rank 0. Other ranks get MPI_COMM_NULL. */
+    MPI_Comm roots_comm;
+    MPI_Comm_split(comm, sub_rank == 0 ? 0 : MPI_UNDEFINED, my_group, &roots_comm);
+    profiler_stop(TIMER_COMM);
+
     int group_cols = heads_per_group * d_k;
 
-    /* Tensor for this group's Q/K/V slice (only meaningful at group root == sub_rank 0) */
+    /* Each group root's Q/K/V/O slice for its heads. */
     Tensor Qg = tensor_alloc(seq_len, group_cols);
     Tensor Kg = tensor_alloc(seq_len, group_cols);
     Tensor Vg = tensor_alloc(seq_len, group_cols);
     Tensor Og = tensor_alloc(seq_len, group_cols);
     tensor_zero(&Og);
 
-    /* The global root (rank 0) extracts each group's slice and sends to the group root */
+    /* DISTRIBUTE: master packs each group's column slice contiguously and
+     * scatters one equal-size block to every group root in a single collective. */
     profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
-    if (rank == 0) {
-        /* Own group: copy directly */
-        for (int i = 0; i < seq_len; i++) {
-            memcpy(&AT(Qg, i, 0), &AT(*Q_full, i, head_start * d_k), group_cols * sizeof(float));
-            memcpy(&AT(Kg, i, 0), &AT(*K_full, i, head_start * d_k), group_cols * sizeof(float));
-            memcpy(&AT(Vg, i, 0), &AT(*V_full, i, head_start * d_k), group_cols * sizeof(float));
-        }
+    if (roots_comm != MPI_COMM_NULL) {
+        int roots_rank;
+        MPI_Comm_rank(roots_comm, &roots_rank);
+        size_t blk = (size_t)seq_len * group_cols;
+        float *packQ = NULL, *packK = NULL, *packV = NULL;
 
-        /* Send slices to each other group's root (the first rank of that group) */
-        for (int g = 1; g < num_groups; g++) {
-            int dest_rank  = g * procs_per_group;   /* global rank of group g's root */
-            int gs         = g * heads_per_group;
-            int gc         = heads_per_group * d_k;
-
-            float *tmp_q = malloc((size_t)seq_len * gc * sizeof(float));
-            float *tmp_k = malloc((size_t)seq_len * gc * sizeof(float));
-            float *tmp_v = malloc((size_t)seq_len * gc * sizeof(float));
-
-            for (int i = 0; i < seq_len; i++) {
-                memcpy(tmp_q + i * gc, &AT(*Q_full, i, gs * d_k), gc * sizeof(float));
-                memcpy(tmp_k + i * gc, &AT(*K_full, i, gs * d_k), gc * sizeof(float));
-                memcpy(tmp_v + i * gc, &AT(*V_full, i, gs * d_k), gc * sizeof(float));
+        if (roots_rank == 0) {
+            packQ = malloc(blk * num_groups * sizeof(float));
+            packK = malloc(blk * num_groups * sizeof(float));
+            packV = malloc(blk * num_groups * sizeof(float));
+            for (int g = 0; g < num_groups; g++) {
+                int cs = g * group_cols;     /* group g owns columns [cs, cs+group_cols) */
+                for (int i = 0; i < seq_len; i++) {
+                    memcpy(packQ + g * blk + (size_t)i * group_cols, &AT(*Q_full, i, cs), group_cols * sizeof(float));
+                    memcpy(packK + g * blk + (size_t)i * group_cols, &AT(*K_full, i, cs), group_cols * sizeof(float));
+                    memcpy(packV + g * blk + (size_t)i * group_cols, &AT(*V_full, i, cs), group_cols * sizeof(float));
+                }
             }
-
-            MPI_Send(tmp_q, seq_len * gc, MPI_FLOAT, dest_rank, 10, comm);
-            MPI_Send(tmp_k, seq_len * gc, MPI_FLOAT, dest_rank, 11, comm);
-            MPI_Send(tmp_v, seq_len * gc, MPI_FLOAT, dest_rank, 12, comm);
-            for (int t = 0; t < 3; t++)
-                profiler_count_msg((long)seq_len * gc * sizeof(float));
-            free(tmp_q); free(tmp_k); free(tmp_v);
         }
-    } else if (sub_rank == 0 && my_group > 0) {
-        /* Group root (not global root): receive from global root */
-        MPI_Recv(Qg.data, seq_len * group_cols, MPI_FLOAT, 0, 10, comm, MPI_STATUS_IGNORE);
-        MPI_Recv(Kg.data, seq_len * group_cols, MPI_FLOAT, 0, 11, comm, MPI_STATUS_IGNORE);
-        MPI_Recv(Vg.data, seq_len * group_cols, MPI_FLOAT, 0, 12, comm, MPI_STATUS_IGNORE);
-        for (int t = 0; t < 3; t++)
-            profiler_count_msg((long)seq_len * group_cols * sizeof(float));
+
+        MPI_Scatter(packQ, seq_len * group_cols, MPI_FLOAT, Qg.data, seq_len * group_cols, MPI_FLOAT, 0, roots_comm);
+        MPI_Scatter(packK, seq_len * group_cols, MPI_FLOAT, Kg.data, seq_len * group_cols, MPI_FLOAT, 0, roots_comm);
+        MPI_Scatter(packV, seq_len * group_cols, MPI_FLOAT, Vg.data, seq_len * group_cols, MPI_FLOAT, 0, roots_comm);
+        profiler_count_msg((long)seq_len * group_cols * sizeof(float) * 3);
+
+        if (roots_rank == 0) { free(packQ); free(packK); free(packV); }
     }
     profiler_stop(TIMER_COMM);
 
-    /* Each group runs tensor-parallel attention on its heads sequentially */
+    /* COMPUTE: each group runs the 1D tensor-parallel kernel on its heads, one at
+     * a time, within its sub-communicator. */
     for (int h = 0; h < heads_per_group; h++) {
         Tensor Qh = tensor_alloc(seq_len, d_k);
         Tensor Kh = tensor_alloc(seq_len, d_k);
@@ -97,7 +99,6 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
         Tensor Oh = tensor_alloc(seq_len, d_k);
         tensor_zero(&Oh);
 
-        /* Extract head h from the group slice (only sub_rank 0 has valid data) */
         if (sub_rank == 0) {
             for (int i = 0; i < seq_len; i++) {
                 memcpy(&AT(Qh, i, 0), &AT(Qg, i, h * d_k), d_k * sizeof(float));
@@ -106,12 +107,10 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
             }
         }
 
-        /* Run tensor-parallel attention for this head within the sub-communicator.
-         * Sub-groups are typically not perfect squares (e.g. size 2), so we use
-         * the 1D path (use_cannon = 0) which works for any process count. */
-        tensor_parallel_attention(&Qh, &Kh, &Vh, &Oh, 0, sub_comm);
+        /* Sub-groups are usually not perfect squares (e.g. size 2), so use the 1D
+         * path which works for any process count. */
+        tensor_parallel_attention(&Qh, &Kh, &Vh, &Oh, TP_1D, sub_comm);
 
-        /* sub_rank 0 writes result into Og */
         if (sub_rank == 0) {
             for (int i = 0; i < seq_len; i++)
                 memcpy(&AT(Og, i, h * d_k), &AT(Oh, i, 0), d_k * sizeof(float));
@@ -121,35 +120,32 @@ void hybrid_mha(const Tensor *Q_full, const Tensor *K_full, const Tensor *V_full
         tensor_free(&Vh); tensor_free(&Oh);
     }
 
-    /* Collect results from each group's root back to global root (rank 0) */
+    /* COLLECT: gather each group root's result back to the master in a single
+     * collective, then unpack into the right columns of out_full. */
     profiler_wait_barrier(comm);   /* separate sync wait from transfer */
     profiler_start(TIMER_COMM);
-    if (rank == 0) {
-        /* Copy own group result directly */
-        for (int i = 0; i < seq_len; i++)
-            memcpy(&AT(*out_full, i, head_start * d_k), &AT(Og, i, 0), group_cols * sizeof(float));
+    if (roots_comm != MPI_COMM_NULL) {
+        int roots_rank;
+        MPI_Comm_rank(roots_comm, &roots_rank);
+        size_t blk = (size_t)seq_len * group_cols;
+        float *packO = (roots_rank == 0) ? malloc(blk * num_groups * sizeof(float)) : NULL;
 
-        /* Receive from each other group's root */
-        for (int g = 1; g < num_groups; g++) {
-            int src_rank = g * procs_per_group;
-            int gs       = g * heads_per_group;
-            int gc       = heads_per_group * d_k;
-            float *tmp   = malloc((size_t)seq_len * gc * sizeof(float));
-
-            MPI_Recv(tmp, seq_len * gc, MPI_FLOAT, src_rank, 20, comm, MPI_STATUS_IGNORE);
-            profiler_count_msg((long)seq_len * gc * sizeof(float));
-
-            for (int i = 0; i < seq_len; i++)
-                memcpy(&AT(*out_full, i, gs * d_k), tmp + i * gc, gc * sizeof(float));
-            free(tmp);
-        }
-    } else if (sub_rank == 0 && my_group > 0) {
-        MPI_Send(Og.data, seq_len * group_cols, MPI_FLOAT, 0, 20, comm);
+        MPI_Gather(Og.data, seq_len * group_cols, MPI_FLOAT, packO, seq_len * group_cols, MPI_FLOAT, 0, roots_comm);
         profiler_count_msg((long)seq_len * group_cols * sizeof(float));
+
+        if (roots_rank == 0) {
+            for (int g = 0; g < num_groups; g++) {
+                int cs = g * group_cols;
+                for (int i = 0; i < seq_len; i++)
+                    memcpy(&AT(*out_full, i, cs), packO + g * blk + (size_t)i * group_cols, group_cols * sizeof(float));
+            }
+            free(packO);
+        }
     }
     profiler_stop(TIMER_COMM);
 
     tensor_free(&Qg); tensor_free(&Kg);
     tensor_free(&Vg); tensor_free(&Og);
+    if (roots_comm != MPI_COMM_NULL) MPI_Comm_free(&roots_comm);
     MPI_Comm_free(&sub_comm);
 }

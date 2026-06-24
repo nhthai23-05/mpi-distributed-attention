@@ -10,6 +10,9 @@
 # Force C locale so awk/printf use '.' decimals — a ',' decimal (some locales)
 # would corrupt the comma-separated CSV and break the imbalance arithmetic.
 export LC_ALL=C
+# Single-threaded by default so per-rank compute reflects pure MPI work.
+# Override with OMP_NUM_THREADS=N to profile the hybrid MPI+OpenMP balance.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 BINARY="./hybrid_attention"
 MODE="${MODE:-hybrid}"
@@ -21,7 +24,7 @@ RESULTS_DIR="results"
 mkdir -p "$RESULTS_DIR"
 OUT="$RESULTS_DIR/granularity.csv"
 
-echo "rank,seq_len,t_io,t_compute,t_comm" > "$OUT"
+echo "rank,seq_len,t_io,t_compute,t_comm,t_wait,msgs,bytes,latency_us" > "$OUT"
 
 echo "Running granularity benchmark: N=$N, procs=$TOTAL_PROCS, mode=$MODE"
 step_start=$SECONDS
@@ -31,7 +34,7 @@ mpirun --oversubscribe --prefix /usr \
        --mca btl_tcp_if_include "${NET:-192.168.0.0/24}" \
        --mca oob_tcp_if_include "${NET:-192.168.0.0/24}" \
        -np "$TOTAL_PROCS" --hostfile "$HOSTFILE" \
-       "$BINARY" --mode "$MODE" --seq-len "$N" --csv --no-check --progress \
+       "$BINARY" --mode "$MODE" --seq-len "$N" --csv --no-check --progress --profile-wait \
     | grep -v "^rank" >> "$OUT"
 
 echo "  (wall $(( SECONDS - step_start ))s)"

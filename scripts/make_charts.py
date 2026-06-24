@@ -36,6 +36,15 @@ def _read(path):
         return list(csv.DictReader(f))
 
 
+def _optf(row, key, default=0.0):
+    """Read an optional numeric CSV field (older CSVs may lack the C2 columns)."""
+    try:
+        v = row.get(key, default)
+        return float(v) if v not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
+
+
 def chart_b(results_dir):
     """Chart B: program execution time vs input size N, with and without comm.
 
@@ -86,15 +95,22 @@ def chart_c(results_dir):
     ranks = [int(r["rank"]) for r in rows]
     comp = [float(r["t_compute"]) for r in rows]
     comm = [float(r["t_comm"]) for r in rows]
-    totals = [c + m for c, m in zip(comp, comm)]
+    wait = [_optf(r, "t_wait") for r in rows]
+    msgs = [int(_optf(r, "msgs")) for r in rows]
+    byts = [int(_optf(r, "bytes")) for r in rows]
+    has_wait = any(w > 0 for w in wait)
+    totals = [c + m + w for c, m, w in zip(comp, comm, wait)]
 
-    fig, ax = plt.subplots(figsize=(max(8, len(ranks) * 0.5), 5))
+    fig, ax = plt.subplots(figsize=(max(8, len(ranks) * 0.6), 5))
     ax.bar(ranks, comp, label="computation", color="#1f77b4")
     ax.bar(ranks, comm, bottom=comp, label="communication", color="#ff7f0e")
+    if has_wait:
+        base = [c + m for c, m in zip(comp, comm)]
+        ax.bar(ranks, wait, bottom=base, label="wait (idle at sync)", color="#d62728")
     ax.set_xlabel("Process rank")
     ax.set_ylabel("Time (s)")
     n = rows[0]["seq_len"]
-    ax.set_title(f"Chart C — Per-process compute vs comm  (N={n}, P={len(ranks)})")
+    ax.set_title(f"Chart C — Per-process compute / comm / wait  (N={n}, P={len(ranks)})")
     ax.set_xticks(ranks)
     ax.grid(True, axis="y", ls=":", alpha=0.5)
     ax.legend()
@@ -102,7 +118,11 @@ def chart_c(results_dir):
     lo, hi = min(totals), max(totals)
     imbalance = (hi - lo) / lo * 100 if lo > 0 else 0.0
     verdict = "BALANCED (<=25%)" if imbalance <= 25 else "IMBALANCED (>25%) — adjust granularity"
-    ax.text(0.5, 0.97, f"load imbalance (max-min)/min = {imbalance:.1f}%  -> {verdict}",
+    note = f"load imbalance (max-min)/min = {imbalance:.1f}%  -> {verdict}"
+    if sum(msgs) or sum(byts):
+        note += (f"\ntransfers this run: {sum(msgs)} msgs, "
+                 f"{sum(byts)/1e6:.1f} MB total across {len(ranks)} ranks")
+    ax.text(0.5, 0.97, note,
             transform=ax.transAxes, ha="center", va="top",
             bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9))
     out = os.path.join(results_dir, "chart-c-granularity.png")
@@ -132,7 +152,15 @@ def chart_d(results_dir):
     sp_with = [_f(r["speedup_with"]) for r in rows]
     sp_no = [_f(r["speedup_no"]) for r in rows]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    # C2: communication volume / link latency per P (optional columns).
+    has_comm = "bytes" in rows[0] or "latency_us" in rows[0]
+    byts = [_optf(r, "bytes") for r in rows]
+    lat  = [_optf(r, "latency_us") for r in rows]
+
+    ncols = 3 if has_comm else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 5))
+    ax1, ax2 = axes[0], axes[1]
+
     ax1.plot(procs, t_with, "o-", label="with communication", color="#1f77b4")
     ax1.plot(procs, t_no, "s--", label="computation only", color="#ff7f0e")
     ax1.set_xlabel("Processes P"); ax1.set_ylabel("Runtime (s)")
@@ -148,7 +176,106 @@ def chart_d(results_dir):
     ax2.set_xscale("log", base=2); ax2.set_xticks(procs); ax2.set_xticklabels(procs)
     ax2.grid(True, which="both", ls=":", alpha=0.5); ax2.legend()
 
+    if has_comm:
+        ax3 = axes[2]
+        ax3.plot(procs, [b / 1e6 for b in byts], "o-", color="#9467bd",
+                 label="bytes moved (rank 0)")
+        ax3.set_xlabel("Processes P"); ax3.set_ylabel("Communication volume (MB)")
+        ax3.set_title("Chart D(iii) — Comm volume & link latency vs P")
+        ax3.set_xscale("log", base=2); ax3.set_xticks(procs); ax3.set_xticklabels(procs)
+        ax3.grid(True, which="both", ls=":", alpha=0.5)
+        ax3b = ax3.twinx()
+        ax3b.plot(procs, lat, "s--", color="#8c564b", label="link latency (µs)")
+        ax3b.set_ylabel("One-way link latency (µs)")
+        h1, l1 = ax3.get_legend_handles_labels()
+        h2, l2 = ax3b.get_legend_handles_labels()
+        ax3.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+
     out = os.path.join(results_dir, "chart-d-speedup.png")
+    fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
+    print(f"wrote {out}")
+
+
+def chart_threads(results_dir):
+    """OpenMP thread-scaling (from bench_threads.sh): runtime and speedup vs threads."""
+    path = os.path.join(results_dir, "threads.csv")
+    if not os.path.exists(path):
+        print(f"skip Chart Threads: {path} not found")
+        return
+    rows = sorted(_read(path), key=lambda r: int(r["threads"]))
+    if not rows:
+        print("skip Chart Threads: no data rows")
+        return
+    th = [int(r["threads"]) for r in rows]
+    t  = [float(r["time_s"]) for r in rows]
+    sp = [_optf(r, "speedup") for r in rows]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    ax1.plot(th, t, "o-", color="#1f77b4")
+    ax1.set_xlabel("OpenMP threads (1 MPI rank)"); ax1.set_ylabel("Runtime (s)")
+    ax1.set_title("OpenMP — runtime vs threads")
+    ax1.set_xscale("log", base=2); ax1.set_xticks(th); ax1.set_xticklabels(th)
+    ax1.grid(True, which="both", ls=":", alpha=0.5)
+
+    ax2.plot(th, th, "k:", label="ideal (linear)")
+    ax2.plot(th, sp, "o-", color="#2ca02c", label="measured")
+    ax2.set_xlabel("OpenMP threads (1 MPI rank)"); ax2.set_ylabel("Speedup  T(1)/T(t)")
+    ax2.set_title("OpenMP — speedup vs threads\n(plateaus: kernel is memory-bandwidth bound)")
+    ax2.set_xscale("log", base=2); ax2.set_xticks(th); ax2.set_xticklabels(th)
+    ax2.grid(True, which="both", ls=":", alpha=0.5); ax2.legend()
+
+    out = os.path.join(results_dir, "chart-threads.png")
+    fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
+    print(f"wrote {out}")
+
+
+def chart_ring(results_dir):
+    """Ring vs 1D (from bench_ring_vs_1d.sh).
+
+    Left  : measured total time (compute+comm+wait) vs P.
+    Right : peak K,V rows resident per rank — the key win. 1D broadcasts ALL keys
+            so every rank holds N rows; ring shards them, so each rank holds only
+            ceil(N/P). (Total bytes moved are ~equal — ring trades one broadcast
+            for P-1 smaller shifts — so the advantage is memory + overlap, not
+            volume; on a single shared-memory node ring can even be slightly
+            slower because comm is nearly free there.)
+    """
+    path = os.path.join(results_dir, "ring_vs_1d.csv")
+    if not os.path.exists(path):
+        print(f"skip Chart Ring: {path} not found")
+        return
+    rows = _read(path)
+    if not rows:
+        print("skip Chart Ring: no data rows")
+        return
+    by_var = defaultdict(dict)            # by_var[variant][P] = row
+    for r in rows:
+        by_var[r["variant"]][int(r["procs"])] = r
+    colors = {"1d": "#ff7f0e", "ring": "#1f77b4"}
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    for var in sorted(by_var):
+        Ps    = sorted(by_var[var])
+        total = [float(by_var[var][p]["t_compute"]) + float(by_var[var][p]["t_comm"])
+                 + _optf(by_var[var][p], "t_wait") for p in Ps]
+        # peak resident K,V rows per rank: 1D holds all N, ring holds ceil(N/P)
+        peak  = []
+        for p in Ps:
+            N = int(by_var[var][p]["seq_len"])
+            peak.append(N if var == "1d" else -(-N // p))   # ceil div for ring
+        ax1.plot(Ps, total, "o-", label=var, color=colors.get(var))
+        ax2.plot(Ps, peak, "o-", label=var, color=colors.get(var))
+
+    allP = sorted({int(r["procs"]) for r in rows})
+    ax1.set_xlabel("Processes P"); ax1.set_ylabel("Total time compute+comm+wait (s)")
+    ax1.set_title("Ring vs 1D — measured total time")
+    ax2.set_xlabel("Processes P"); ax2.set_ylabel("Peak K,V rows resident per rank")
+    ax2.set_title("Ring vs 1D — memory footprint per rank\n(1D: O(N) replicated   ring: O(N/P) sharded)")
+    for ax in (ax1, ax2):
+        ax.set_xscale("log", base=2); ax.set_xticks(allP); ax.set_xticklabels(allP)
+        ax.grid(True, which="both", ls=":", alpha=0.5); ax.legend()
+
+    out = os.path.join(results_dir, "chart-ring-vs-1d.png")
     fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
     print(f"wrote {out}")
 
@@ -162,6 +289,8 @@ def main():
     chart_b(args.results_dir)
     chart_c(args.results_dir)
     chart_d(args.results_dir)
+    chart_threads(args.results_dir)
+    chart_ring(args.results_dir)
 
 
 if __name__ == "__main__":
